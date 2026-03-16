@@ -106,6 +106,19 @@ if errorlevel 1 (
 )
 echo.
 
+echo [CHECK] PySide6 package
+%PY_CMD% -c "import PySide6; print('[OK] PySide6 is installed.')" >> "%LOG_FILE%" 2>&1
+if errorlevel 1 (
+    echo [WARN] PySide6 is not installed.
+    echo Install with:
+    echo %PY_CMD% -m pip install PySide6
+    >> "%LOG_FILE%" echo [WARN] PySide6 is not installed.
+) else (
+    echo [OK] PySide6 is available.
+    >> "%LOG_FILE%" echo [OK] PySide6 is available.
+)
+echo.
+
 echo [CHECK] Key project files
 if exist "attendance_gui.py" (
     echo [OK] attendance_gui.py
@@ -161,6 +174,22 @@ if exist "attendance_customtkinter.spec" (
 ) else (
     echo [WARN] attendance_customtkinter.spec not found
     >> "%LOG_FILE%" echo [WARN] attendance_customtkinter.spec not found
+)
+
+if exist "attendance_pyside6.py" (
+    echo [OK] attendance_pyside6.py
+    >> "%LOG_FILE%" echo [OK] attendance_pyside6.py
+) else (
+    echo [WARN] attendance_pyside6.py not found
+    >> "%LOG_FILE%" echo [WARN] attendance_pyside6.py not found
+)
+
+if exist "attendance_pyside6.spec" (
+    echo [OK] attendance_pyside6.spec
+    >> "%LOG_FILE%" echo [OK] attendance_pyside6.spec
+) else (
+    echo [WARN] attendance_pyside6.spec not found
+    >> "%LOG_FILE%" echo [WARN] attendance_pyside6.spec not found
 )
 echo.
 

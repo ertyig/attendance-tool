@@ -2,9 +2,10 @@
 
 用于按月汇总考勤、请假和年假数据，并生成年度合计 Excel。
 
-当前项目包含 3 个界面入口：
+当前项目包含 4 个界面入口：
 
 - 主版本：`ttkbootstrap + litera`
+- 附加版本：`PySide6`
 - 附加版本：`CustomTkinter`
 - 附加版本：`NiceGUI`
 
@@ -29,12 +30,12 @@
 
 每个月需要 2 个文件：
 
-1. `考勤打卡记录表.xls`
-2. `请假记录表.xls`
+1. 文件名包含 `考勤` 的 Excel
+2. 文件名包含 `请假` 的 Excel
 
 另外还有 1 个单独维护的“当前年假表”：
 
-3. `员工年假总数表.xlsx`
+3. 文件名包含 `年假` 的 Excel
 
 当前年假表通常放在 `data/月度文件/` 根目录下，只有员工年假信息发生变化时才需要更新。
 
@@ -61,6 +62,7 @@ data/
 桌面 GUI：
 
 - [`attendance_gui.py`](/Users/leechain/project/attendance-tool/attendance_gui.py)
+- [`attendance_pyside6.py`](/Users/leechain/project/attendance-tool/attendance_pyside6.py)
 - [`attendance_customtkinter.py`](/Users/leechain/project/attendance-tool/attendance_customtkinter.py)
 
 Web GUI：
@@ -70,9 +72,11 @@ Web GUI：
 Windows 脚本：
 
 - [`运行考勤统计.bat`](/Users/leechain/project/attendance-tool/运行考勤统计.bat)
+- [`运行考勤统计_PySide6.bat`](/Users/leechain/project/attendance-tool/运行考勤统计_PySide6.bat)
 - [`运行考勤统计_CustomTkinter.bat`](/Users/leechain/project/attendance-tool/运行考勤统计_CustomTkinter.bat)
 - [`运行考勤统计_NiceGUI.bat`](/Users/leechain/project/attendance-tool/运行考勤统计_NiceGUI.bat)
 - [`打包Windows程序.bat`](/Users/leechain/project/attendance-tool/打包Windows程序.bat)
+- [`打包Windows程序_PySide6.bat`](/Users/leechain/project/attendance-tool/打包Windows程序_PySide6.bat)
 - [`打包Windows程序_CustomTkinter.bat`](/Users/leechain/project/attendance-tool/打包Windows程序_CustomTkinter.bat)
 - [`打包Windows程序_NiceGUI.bat`](/Users/leechain/project/attendance-tool/打包Windows程序_NiceGUI.bat)
 - [`一键环境检查.bat`](/Users/leechain/project/attendance-tool/一键环境检查.bat)
@@ -103,7 +107,19 @@ python3 attendance_gui.py
 python3 -m pip install ttkbootstrap pandas openpyxl xlrd holidays chinese-calendar
 ```
 
-### 3. 运行 CustomTkinter 版本
+### 3. 运行 PySide6 版本
+
+```bash
+python3 attendance_pyside6.py
+```
+
+依赖：
+
+```bash
+python3 -m pip install PySide6 pandas openpyxl xlrd holidays chinese-calendar
+```
+
+### 4. 运行 CustomTkinter 版本
 
 ```bash
 python3 attendance_customtkinter.py
@@ -115,7 +131,7 @@ python3 attendance_customtkinter.py
 python3 -m pip install customtkinter pandas openpyxl xlrd holidays chinese-calendar
 ```
 
-### 4. 运行 NiceGUI 版本
+### 5. 运行 NiceGUI 版本
 
 ```bash
 python3 attendance_nicegui.py
@@ -139,6 +155,11 @@ CustomTkinter 版本：
 - 双击 [`打包Windows程序_CustomTkinter.bat`](/Users/leechain/project/attendance-tool/打包Windows程序_CustomTkinter.bat)
 - 输出：`dist\\考勤统计助手_CustomTkinter.exe`
 
+PySide6 版本：
+
+- 双击 [`打包Windows程序_PySide6.bat`](/Users/leechain/project/attendance-tool/打包Windows程序_PySide6.bat)
+- 输出：`dist\\考勤统计助手_PySide6.exe`
+
 NiceGUI 版本：
 
 - 双击 [`打包Windows程序_NiceGUI.bat`](/Users/leechain/project/attendance-tool/打包Windows程序_NiceGUI.bat)
@@ -161,8 +182,9 @@ NiceGUI 版本：
 2. 选择年份
 3. 选择月份
 4. 点击 `上传所选月份2个表`
-5. 点击 `生成结果文件`
-6. 点击 `打开生成好的 Excel`
+5. 点击 `检查当前年份文件`
+6. 点击 `生成结果文件`
+7. 点击 `打开生成好的 Excel`
 
 结果文件名固定为：
 
@@ -177,8 +199,10 @@ NiceGUI 版本：
 - 一次只统计一个年份的数据
 - 每个月文件夹里只需要考勤表和请假表，每类只能有 1 个
 - 当前年假表单独维护，只有变更时才需要更新
-- 如果某个月缺文件或重复文件，程序会阻止生成
-- 年度合计基于当前数据目录下同一年份的所有月份文件重算
+- 文件名支持模糊匹配，建议分别包含 `考勤`、`请假`、`年假`
+- 当前选中年份里，已经准备好的月份会进入统计
+- 还没准备好的月份会保留在待处理列表里
+- 年度合计基于当前数据目录下同一年份的所有已识别月份重算
 
 ## 给同事使用
 
@@ -191,5 +215,6 @@ NiceGUI 版本：
 ## 版本状态
 
 - 主版本：稳定，建议交付
+- PySide6：新版本，适合继续做更强的桌面 UI
 - CustomTkinter：可运行，可单独打包，适合继续对比视觉效果
 - NiceGUI：可运行，可单独打包，更适合做现代化界面原型

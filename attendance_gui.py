@@ -11,9 +11,11 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from datetime import datetime
 from datetime import date
+from fnmatch import fnmatch
 from pathlib import Path
 
 # Some macOS setups export SYSTEM_VERSION_COMPAT=1, which makes older
@@ -45,11 +47,13 @@ except Exception:  # pragma: no cover
 from attendance_report import (
     DATA_DIR,
     OUTPUT_FILE,
+    MonthFolderInspection,
     MonthlySourceBundle,
     ReportSummary,
     discover_monthly_source_bundles,
     generate_report,
     get_current_annual_leave_summary,
+    inspect_month_source_folders,
 )
 
 
@@ -75,18 +79,23 @@ RUN_BG = "#2F6FA3"
 RUN_FG = "#FFFFFF"
 OPEN_BG = "#EEF3F8"
 OPEN_FG = "#4C6278"
+RUNTIME_LOG_MAX_BYTES = 2 * 1024 * 1024
+RUNTIME_LOG_BACKUP_COUNT = 1
 FILE_KIND_CONFIG = {
     "attendance": {
         "label": "考勤打卡记录表",
         "file_names": ["考勤打卡记录表.xls", "考勤打卡记录表.xlsx"],
+        "patterns": ["*考勤*.xls", "*考勤*.xlsx", "a.xls", "a.xlsx"],
     },
     "leave": {
         "label": "请假记录表",
         "file_names": ["请假记录表.xls", "请假记录表.xlsx"],
+        "patterns": ["*请假*.xls", "*请假*.xlsx", "b.xls", "b.xlsx"],
     },
     "annual": {
         "label": "员工年假总数表",
-        "file_names": ["员工年假总数表.xls", "员工年假总数表.xlsx"],
+        "file_names": ["员工年假总数表.xls", "员工年假总数表.xlsx", "当前员工年假总数表.xls", "当前员工年假总数表.xlsx"],
+        "patterns": ["*年假*.xls", "*年假*.xlsx", "c.xls", "c.xlsx"],
     },
 }
 CURRENT_ANNUAL_TARGET_STEM = "当前员工年假总数表"
@@ -118,6 +127,10 @@ def _fallback_usage_file() -> Path:
 
 def _startup_log_file() -> Path:
     return (_app_root() / "attendance_gui_startup.log").resolve()
+
+
+def _runtime_log_file() -> Path:
+    return (_app_root() / "attendance_runtime.log").resolve()
 
 
 def _open_path(path: Path) -> None:
@@ -174,6 +187,23 @@ def _parse_month_input(raw_text: str) -> tuple[int, int] | None:
     return year, month
 
 
+def _find_matching_files(directory: Path, patterns: list[str]) -> list[Path]:
+    if not directory.exists():
+        return []
+    matches: list[Path] = []
+    seen: set[Path] = set()
+    for child in sorted(directory.iterdir()):
+        if not child.is_file():
+            continue
+        lower_name = child.name.lower()
+        if any(fnmatch(lower_name, pattern.lower()) for pattern in patterns):
+            resolved = child.resolve()
+            if resolved not in seen:
+                matches.append(child)
+                seen.add(resolved)
+    return matches
+
+
 def _friendly_scan_error(exc: Exception) -> str:
     message = str(exc)
     if "多个年份" in message:
@@ -211,20 +241,106 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
         self.annual_info_var = tk.StringVar(value="当前年假表：未上传")
         self.summary_var = tk.StringVar(value="先上传当前年假表，再选择年月上传该月 2 个表")
         self.status_var = tk.StringVar(value="准备就绪。")
+        self.selected_month_state_var = tk.StringVar(value="当前月份状态：未检查")
+        self.selected_month_detail_var = tk.StringVar(value="选择年份和月份后，会显示该月是否已经有完整文件。")
+        self.selected_month_attendance_var = tk.StringVar(value="考勤文件：未检查")
+        self.selected_month_leave_var = tk.StringVar(value="请假文件：未检查")
+        self.issue_only_var = tk.BooleanVar(value=False)
         self.current_bundles: list[MonthlySourceBundle] = []
         self.runtime_logs: list[str] = []
+        self._runtime_log_buffer: list[str] = []
         self.month_issue_details: dict[str, str] = {}
+        self.last_scan_error_message: str = ""
+        self.runtime_log_path = _runtime_log_file()
+        self._scan_cache_key: object | None = None
+        self._scan_cache_bundles: list[MonthlySourceBundle] = []
+        self._scan_cache_error: str = ""
+        self._last_full_scan_key: object | None = None
+        self._last_scan_used_cache = False
+        self._last_scan_feedback = ""
+        self._folder_cache_key: object | None = None
+        self._folder_cache_inspections: list[MonthFolderInspection] = []
+        self._last_scan_duration_seconds = 0.0
 
         self.log_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self.run_thread: threading.Thread | None = None
+        self._closing = False
+        self._poll_after_id: str | None = None
+        self._startup_scan_after_id: str | None = None
+        self._runtime_log_flush_after_id: str | None = None
 
         self._configure_style()
         self._build_ui()
+        self._start_runtime_log_session()
         self._refresh_annual_info()
         self._refresh_year_values()
         self._on_selected_month_changed()
-        self.after(120, self._poll_log_queue)
-        self.after(200, self.scan_bundles)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._poll_after_id = self.after(120, self._poll_log_queue)
+        self._startup_scan_after_id = self.after(200, self.refresh_folder_overview)
+
+    def _on_close(self) -> None:
+        self._closing = True
+        for after_id in (self._poll_after_id, self._startup_scan_after_id, self._runtime_log_flush_after_id):
+            if after_id:
+                try:
+                    self.after_cancel(after_id)
+                except Exception:
+                    pass
+        self._poll_after_id = None
+        self._startup_scan_after_id = None
+        self._runtime_log_flush_after_id = None
+        self._flush_runtime_log_buffer()
+        try:
+            self.quit()
+        except Exception:
+            pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+    def _build_scan_cache_key(self, data_dir: Path, selected_year: int | None) -> tuple[object, ...]:
+        files: list[Path] = []
+        files.extend(_find_matching_files(data_dir, FILE_KIND_CONFIG["annual"]["patterns"]))
+        if data_dir.exists():
+            for child in sorted(data_dir.iterdir()):
+                if not child.is_dir():
+                    continue
+                parsed = _parse_month_input(child.name)
+                if parsed is None:
+                    continue
+                year, _ = parsed
+                if selected_year is not None and year != selected_year:
+                    continue
+                files.extend(_find_matching_files(child, FILE_KIND_CONFIG["attendance"]["patterns"]))
+                files.extend(_find_matching_files(child, FILE_KIND_CONFIG["leave"]["patterns"]))
+                files.extend(_find_matching_files(child, FILE_KIND_CONFIG["annual"]["patterns"]))
+        signature = []
+        for path in sorted({p.resolve(): p for p in files}.values(), key=lambda item: str(item)):
+            try:
+                stat = path.stat()
+                signature.append((str(path.resolve()), stat.st_mtime_ns, stat.st_size))
+            except FileNotFoundError:
+                continue
+        return (str(data_dir.resolve()), selected_year, tuple(signature))
+
+    def refresh_folder_overview(self) -> None:
+        if self._closing:
+            return
+        self.last_scan_error_message = ""
+        self._refresh_annual_info()
+        self._populate_bundles([], full_scan=False)
+
+    def _get_folder_inspections(self, selected_year: int | None) -> list[MonthFolderInspection]:
+        data_dir = Path(self.data_dir_var.get())
+        cache_key = ("folder", self._build_scan_cache_key(data_dir, selected_year))
+        if self._folder_cache_key == cache_key:
+            return list(self._folder_cache_inspections)
+        inspections = inspect_month_source_folders(str(data_dir), target_year=selected_year)
+        self._folder_cache_key = cache_key
+        self._folder_cache_inspections = list(inspections)
+        return list(inspections)
 
     def _bs(self, bootstyle: str | None = None) -> dict[str, str]:
         if BOOTSTRAP_ENABLED and bootstyle:
@@ -318,6 +434,10 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
             raise ValueError("月份不正确。")
         return year, month
 
+    def _get_selected_year(self) -> int:
+        year, _ = self._get_selected_year_month()
+        return year
+
     def _selected_month_folder_name(self) -> str:
         year, month = self._get_selected_year_month()
         return f"{year}-{month:02d}"
@@ -330,11 +450,163 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
 
     def _on_selected_month_changed(self) -> None:
         try:
-            folder_name = self._selected_month_folder_name()
+            year, month = self._get_selected_year_month()
+            folder_name = f"{year}-{month:02d}"
         except ValueError:
             return
-        self.summary_var.set(f"当前准备上传：{folder_name}")
-        self.status_var.set("选择好该月后，点击中间的“上传所选月份2个表”。")
+        base_dir = Path(self.data_dir_var.get())
+        month_dir = base_dir / folder_name
+        attendance_files = self._find_existing_month_files(month_dir, "attendance")
+        leave_files = self._find_existing_month_files(month_dir, "leave")
+        has_any_data = month_dir.exists() and any(month_dir.iterdir()) if month_dir.exists() else False
+
+        if not attendance_files and not leave_files and not has_any_data:
+            self.selected_month_state_var.set(f"{folder_name}：未放文件")
+            self.selected_month_detail_var.set("这个月份文件夹里还没有识别到考勤或请假文件。")
+            self.selected_month_attendance_var.set("考勤文件：未找到")
+            self.selected_month_leave_var.set("请假文件：未找到")
+            self.summary_var.set(f"当前准备上传：{folder_name}")
+            self.status_var.set(f"{folder_name} 还没有放入文件。选择好该月后，点击“上传所选月份2个表”。")
+        elif len(attendance_files) == 1 and len(leave_files) == 1:
+            self.selected_month_state_var.set(f"{folder_name}：已就绪")
+            self.selected_month_detail_var.set(f"考勤：{attendance_files[0].name}；请假：{leave_files[0].name}")
+            self.selected_month_attendance_var.set(f"考勤文件：已找到（{attendance_files[0].name}）")
+            self.selected_month_leave_var.set(f"请假文件：已找到（{leave_files[0].name}）")
+            self.summary_var.set(f"{folder_name} 已有完整文件")
+            self.status_var.set(f"{folder_name} 已识别到考勤和请假文件，可以直接生成结果。")
+        else:
+            self.selected_month_state_var.set(f"{folder_name}：待处理")
+            detail_parts = []
+            if not attendance_files:
+                detail_parts.append("缺少考勤文件")
+            elif len(attendance_files) > 1:
+                detail_parts.append("重复考勤文件")
+            if not leave_files:
+                detail_parts.append("缺少请假文件")
+            elif len(leave_files) > 1:
+                detail_parts.append("重复请假文件")
+            self.selected_month_detail_var.set("；".join(detail_parts) or "该月文件还不完整，请补齐后再生成。")
+            if len(attendance_files) == 1:
+                self.selected_month_attendance_var.set(f"考勤文件：已找到（{attendance_files[0].name}）")
+            elif len(attendance_files) > 1:
+                self.selected_month_attendance_var.set("考勤文件：重复")
+            else:
+                self.selected_month_attendance_var.set("考勤文件：未找到")
+            if len(leave_files) == 1:
+                self.selected_month_leave_var.set(f"请假文件：已找到（{leave_files[0].name}）")
+            elif len(leave_files) > 1:
+                self.selected_month_leave_var.set("请假文件：重复")
+            else:
+                self.selected_month_leave_var.set("请假文件：未找到")
+            self.summary_var.set(f"{folder_name} 已有部分文件")
+            self.status_var.set(f"{folder_name} 还需处理：{self.selected_month_detail_var.get()}")
+        self._apply_selected_file_status_colors()
+
+    def _selected_file_status_color(self, text: str) -> str:
+        if "已找到" in text:
+            return SUCCESS
+        if "重复" in text or "未找到" in text:
+            return ERROR
+        return INK
+
+    def _apply_selected_file_status_colors(self) -> None:
+        if hasattr(self, "selected_month_attendance_label"):
+            self.selected_month_attendance_label.configure(fg=self._selected_file_status_color(self.selected_month_attendance_var.get()))
+        if hasattr(self, "selected_month_leave_label"):
+            self.selected_month_leave_label.configure(fg=self._selected_file_status_color(self.selected_month_leave_var.get()))
+
+    def check_selected_year_files(self) -> None:
+        self.scan_bundles()
+        self._show_year_check_result()
+
+    def _on_issue_only_changed(self) -> None:
+        self._populate_bundles(self.current_bundles)
+        self._apply_detail_column_visibility()
+
+    def _apply_detail_column_visibility(self) -> None:
+        if not hasattr(self, "bundle_tree"):
+            return
+        if self.issue_only_var.get():
+            self.bundle_tree.column("detail", width=260, minwidth=220, stretch=True)
+            self.bundle_tree.heading("detail", text="问题说明")
+        else:
+            self.bundle_tree.column("detail", width=0, minwidth=0, stretch=False)
+            self.bundle_tree.heading("detail", text="")
+
+    def _show_year_check_result(self) -> None:
+        try:
+            year = self._get_selected_year()
+        except ValueError:
+            return
+        rows, issues = self._inspect_month_folders()
+        ready_months = [str(row["month"])[5:7] for row in rows if row.get("tag") == "ok"]
+        issue_months = [str(row["month"]) for row in rows if row.get("detail")]
+
+        lines = [f"{year} 年检查结果：", ""]
+        if self._last_scan_feedback:
+            lines.append(self._last_scan_feedback)
+            lines.append("")
+        if ready_months:
+            lines.append(f"已识别月份：{'、'.join(ready_months)}")
+        else:
+            lines.append("已识别月份：无")
+
+        if issue_months:
+            lines.append(f"待处理月份：{'、'.join(issue_months)}")
+            lines.append("")
+            lines.extend(issues[:6])
+        else:
+            lines.append("待处理月份：无")
+
+        messagebox.showinfo("检查结果", "\n".join(lines))
+
+    def _show_generation_success_dialog(self, summary: ReportSummary) -> None:
+        processed_months = [f"{item.bundle.month:02d}" for item in summary.monthly_results]
+        rows, issues = self._inspect_month_folders()
+        skipped_months = [str(row["month"]) for row in rows if row.get("detail")]
+
+        dialog = tk.Toplevel(self)
+        dialog.title("生成完成")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.configure(bg="#F7FAFC")
+        dialog.resizable(False, False)
+
+        box = tk.Frame(dialog, bg="#FFFFFF", highlightbackground=LINE, highlightthickness=1, bd=0)
+        box.pack(fill="both", expand=True, padx=18, pady=18)
+
+        tk.Label(box, text="结果文件已生成", bg="#FFFFFF", fg=INK, font=("Microsoft YaHei UI", 16, "bold")).pack(anchor="w", padx=18, pady=(18, 8))
+        tk.Label(
+            box,
+            text="\n".join(
+                [
+                    f"保存位置：{summary.output_file}",
+                    f"已统计月份：{'、'.join(processed_months) if processed_months else '无'}",
+                    f"待处理月份：{'、'.join(skipped_months) if skipped_months else '无'}",
+                ]
+            ),
+            bg="#FFFFFF",
+            fg=INK,
+            justify="left",
+            anchor="w",
+            font=("Microsoft YaHei UI", 11),
+        ).pack(anchor="w", padx=18)
+        if issues:
+            tk.Label(
+                box,
+                text="\n".join(issues[:5]),
+                bg="#FFFFFF",
+                fg=MUTED,
+                justify="left",
+                anchor="w",
+                font=("Microsoft YaHei UI", 10),
+            ).pack(anchor="w", padx=18, pady=(10, 0))
+
+        btn_row = tk.Frame(box, bg="#FFFFFF")
+        btn_row.pack(anchor="e", padx=18, pady=(16, 18))
+        ttk.Button(btn_row, text="打开 Excel", style="App.TButton", command=lambda: (_open_path(summary.output_file), dialog.destroy()), **self._bs(f"{PRIMARY}")).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(btn_row, text="打开结果文件夹", style="App.TButton", command=lambda: (_open_path(summary.output_file.parent), dialog.destroy()), **self._bs(f"{SECONDARY}-{OUTLINE}")).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(btn_row, text="关闭", style="App.TButton", command=dialog.destroy, **self._bs(f"{INFO}-{OUTLINE}")).grid(row=0, column=2)
 
     def _configure_style(self) -> None:
         style = getattr(self, "style", None) or ttk.Style(self)
@@ -597,8 +869,18 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
         )
         self.month_combo.grid(row=2, column=4, sticky="ew", padx=(0, 0), pady=(0, 14), ipady=3)
 
+        month_state_box = tk.Frame(select_box, bg="#F6FAFD", highlightbackground="#D8E4EE", highlightthickness=1, bd=0)
+        month_state_box.grid(row=3, column=0, columnspan=6, sticky="ew", padx=18, pady=(0, 12))
+        tk.Label(month_state_box, text="当前月份状态", bg="#F6FAFD", fg=MUTED, font=("Microsoft YaHei UI", 10, "bold")).grid(row=0, column=0, sticky="w", padx=14, pady=(10, 2))
+        tk.Label(month_state_box, textvariable=self.selected_month_state_var, bg="#F6FAFD", fg=INK, font=("Microsoft YaHei UI", 12, "bold"), anchor="w", justify="left").grid(row=1, column=0, sticky="w", padx=14)
+        self.selected_month_attendance_label = tk.Label(month_state_box, textvariable=self.selected_month_attendance_var, bg="#F6FAFD", fg=INK, font=("Microsoft YaHei UI", 10), anchor="w", justify="left", wraplength=760)
+        self.selected_month_attendance_label.grid(row=2, column=0, sticky="w", padx=14, pady=(4, 0))
+        self.selected_month_leave_label = tk.Label(month_state_box, textvariable=self.selected_month_leave_var, bg="#F6FAFD", fg=INK, font=("Microsoft YaHei UI", 10), anchor="w", justify="left", wraplength=760)
+        self.selected_month_leave_label.grid(row=3, column=0, sticky="w", padx=14, pady=(2, 0))
+        tk.Label(month_state_box, textvariable=self.selected_month_detail_var, bg="#F6FAFD", fg=MUTED, font=("Microsoft YaHei UI", 10), anchor="w", justify="left", wraplength=760).grid(row=4, column=0, sticky="w", padx=14, pady=(2, 10))
+
         button_row = tk.Frame(select_box, bg="#FCF8F3")
-        button_row.grid(row=3, column=0, columnspan=6, pady=(6, 14))
+        button_row.grid(row=4, column=0, columnspan=6, pady=(6, 14))
 
         self.upload_button = self._make_action_button(
             button_row,
@@ -611,6 +893,17 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
         )
         self.upload_button.grid(row=0, column=0, padx=10)
 
+        self.check_button = self._make_action_button(
+            button_row,
+            "检查当前年份文件",
+            self.check_selected_year_files,
+            OPEN_BG,
+            OPEN_FG,
+            border="#BFD2F2",
+            bootstyle=f"{INFO}-{OUTLINE}",
+        )
+        self.check_button.grid(row=0, column=1, padx=10)
+
         self.run_button = self._make_action_button(
             button_row,
             "生成结果文件",
@@ -620,7 +913,7 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
             border=ACCENT_DARK,
             bootstyle=f"{PRIMARY}",
         )
-        self.run_button.grid(row=0, column=1, padx=10)
+        self.run_button.grid(row=0, column=2, padx=10)
 
         self.open_button = self._make_action_button(
             button_row,
@@ -631,15 +924,16 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
             border="#BFD2F2",
             bootstyle=f"{SECONDARY}-{OUTLINE}",
         )
-        self.open_button.grid(row=0, column=2, padx=10)
+        self.open_button.grid(row=0, column=3, padx=10)
 
         link_row = tk.Frame(select_box, bg="#FCF8F3")
-        link_row.grid(row=4, column=0, columnspan=6, pady=(0, 14))
+        link_row.grid(row=5, column=0, columnspan=6, pady=(0, 14))
         ttk.Button(link_row, text="打开所选月份文件夹", style="App.TButton", command=self.open_selected_month_folder, **self._bs(f"{SECONDARY}-{OUTLINE}")).grid(row=0, column=0, padx=6)
         ttk.Button(link_row, text="打开放文件夹", style="App.TButton", command=self.open_data_dir, **self._bs(f"{SECONDARY}-{OUTLINE}")).grid(row=0, column=1, padx=6)
+        ttk.Button(link_row, text="打开运行日志", style="App.TButton", command=self.open_runtime_log, **self._bs(f"{SECONDARY}-{OUTLINE}")).grid(row=0, column=2, padx=6)
 
         info_box = tk.Frame(card, bg=SURFACE_ALT, highlightbackground=LINE, highlightthickness=1, bd=0)
-        info_box.grid(row=5, column=0, sticky="ew")
+        info_box.grid(row=6, column=0, sticky="ew")
         info_box.grid_columnconfigure(1, weight=1)
         info_top_line = tk.Frame(info_box, bg="#CBD8E2", height=2)
         info_top_line.grid(row=0, column=0, columnspan=3, sticky="ew")
@@ -674,46 +968,49 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
 
         legend_row = tk.Frame(card, bg=CARD_BG)
         legend_row.grid(row=1, column=1, sticky="e")
-        self._theme_label(
-            legend_row,
-            text="[已就绪]",
-            bootstyle=f"{BS_SUCCESS}-{OUTLINE}",
-            font=("Microsoft YaHei UI", 10, "bold"),
-            foreground=SUCCESS,
-            background=CARD_BG,
-            padding=(10, 5),
-        ).grid(row=0, column=0, padx=(0, 8))
-        self._theme_label(
-            legend_row,
-            text="[需处理]",
-            bootstyle="danger-outline",
-            font=("Microsoft YaHei UI", 10, "bold"),
-            foreground=ERROR,
-            background=CARD_BG,
-            padding=(10, 5),
-        ).grid(row=0, column=1)
+        for idx, (text, fg) in enumerate((
+            ("[已就绪]", SUCCESS),
+            ("[已放1个文件]", WARN),
+            ("[文件重复]", ERROR),
+            ("[未放文件]", MUTED),
+        )):
+            self._theme_label(
+                legend_row,
+                text=text,
+                bootstyle=f"{SECONDARY}-{OUTLINE}" if text == "[未放文件]" else (f"{BS_SUCCESS}-{OUTLINE}" if text == "[已就绪]" else ("danger-outline" if text == "[文件重复]" else f"{INFO}-{OUTLINE}")),
+                font=("Microsoft YaHei UI", 10, "bold"),
+                foreground=fg,
+                background=CARD_BG,
+                padding=(10, 5),
+            ).grid(row=0, column=idx, padx=(0, 8))
 
-        ttk.Label(card, text="双击某个月份可以直接打开对应文件夹。状态列会用标签样式显示是否需要处理。", style="Hint.TLabel").grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 16))
+        ttk.Label(card, text="双击某个月份可以直接打开对应文件夹。状态会区分已就绪、缺1个文件、重复文件和未放文件。", style="Hint.TLabel").grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 16))
+        ttk.Checkbutton(card, text="仅显示待处理月份", variable=self.issue_only_var, command=self._on_issue_only_changed).grid(row=2, column=1, sticky="e", pady=(6, 16))
 
-        columns = ("month", "attendance", "leave", "status")
+        columns = ("month", "attendance", "leave", "status", "detail")
         tree = ttk.Treeview(card, columns=columns, show="headings", height=10)
         tree.heading("month", text="月份")
         tree.heading("attendance", text="考勤文件")
         tree.heading("leave", text="请假文件")
         tree.heading("status", text="状态")
+        tree.heading("detail", text="")
         tree.column("month", width=110, anchor="center")
-        tree.column("attendance", width=260, anchor="w")
-        tree.column("leave", width=260, anchor="w")
+        tree.column("attendance", width=220, anchor="w")
+        tree.column("leave", width=220, anchor="w")
         tree.column("status", width=140, anchor="center")
+        tree.column("detail", width=0, minwidth=0, stretch=False)
         tree.grid(row=3, column=0, sticky="nsew")
         tree.tag_configure("ok", foreground=SUCCESS, background="#EDF8F2")
         tree.tag_configure("warn", foreground=ERROR, background="#FCEDEA")
+        tree.tag_configure("partial", foreground=WARN, background="#FFF6E8")
+        tree.tag_configure("empty", foreground=MUTED, background="#F4F6F8")
         tree.bind("<Double-1>", lambda _event: self.open_tree_selected_month_folder())
 
         scroll = ttk.Scrollbar(card, orient="vertical", command=tree.yview)
         scroll.grid(row=3, column=1, sticky="ns")
         tree.configure(yscrollcommand=scroll.set)
         self.bundle_tree = tree
+        self._apply_detail_column_visibility()
 
         button_row = tk.Frame(card, bg=CARD_BG)
         button_row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(14, 0))
@@ -725,6 +1022,60 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
         self.runtime_logs.append(message)
         if len(self.runtime_logs) > 300:
             self.runtime_logs = self.runtime_logs[-300:]
+        self._append_runtime_log(message)
+
+    def _start_runtime_log_session(self) -> None:
+        self._rotate_runtime_log_if_needed()
+        header = [
+            "",
+            "=" * 72,
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {APP_NAME} {APP_VERSION} session start",
+            f"cwd: {Path.cwd()}",
+            f"script_root: {_app_root()}",
+            "=" * 72,
+        ]
+        with self.runtime_log_path.open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(header) + "\n")
+
+    def _append_runtime_log(self, message: str) -> None:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines = message.splitlines() or [""]
+        for line in lines:
+            self._runtime_log_buffer.append(f"{timestamp} | {line}\n")
+        if self._runtime_log_flush_after_id is None and not self._closing:
+            self._runtime_log_flush_after_id = self.after(250, self._flush_runtime_log_buffer)
+
+    def _flush_runtime_log_buffer(self) -> None:
+        self._runtime_log_flush_after_id = None
+        if not self._runtime_log_buffer:
+            return
+        self.runtime_log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._rotate_runtime_log_if_needed()
+        with self.runtime_log_path.open("a", encoding="utf-8") as handle:
+            handle.writelines(self._runtime_log_buffer)
+        self._runtime_log_buffer.clear()
+
+    def _format_scan_duration(self, seconds: float) -> str:
+        return f"耗时 {seconds:.2f} 秒"
+
+    def _rotate_runtime_log_if_needed(self) -> None:
+        try:
+            if not self.runtime_log_path.exists():
+                return
+            if self.runtime_log_path.stat().st_size < RUNTIME_LOG_MAX_BYTES:
+                return
+        except OSError:
+            return
+        for index in range(RUNTIME_LOG_BACKUP_COUNT, 0, -1):
+            source = self.runtime_log_path.with_suffix(self.runtime_log_path.suffix + ("" if index == 1 else f".{index - 1}"))
+            target = self.runtime_log_path.with_suffix(self.runtime_log_path.suffix + f".{index}")
+            if source.exists():
+                try:
+                    if target.exists():
+                        target.unlink()
+                    source.replace(target)
+                except OSError:
+                    continue
 
     def set_notice(self, title: str, desc: str, level: str = "info") -> None:
         if BOOTSTRAP_ENABLED:
@@ -770,12 +1121,27 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
         selected = filedialog.askdirectory(initialdir=self.data_dir_var.get() or str(_default_data_dir()))
         if selected:
             self.data_dir_var.set(selected)
-            self.scan_bundles()
+            self._scan_cache_key = None
+            self._scan_cache_bundles = []
+            self._scan_cache_error = ""
+            self._last_full_scan_key = None
+            self._last_scan_used_cache = False
+            self._last_scan_feedback = ""
+            self._folder_cache_key = None
+            self._folder_cache_inspections = []
+            self.refresh_folder_overview()
 
     def open_data_dir(self) -> None:
         data_dir = Path(self.data_dir_var.get())
         data_dir.mkdir(parents=True, exist_ok=True)
         _open_path(data_dir)
+
+    def open_runtime_log(self) -> None:
+        self.runtime_log_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.runtime_log_path.exists():
+            self._start_runtime_log_session()
+        self._flush_runtime_log_buffer()
+        _open_path(self.runtime_log_path)
 
     def open_output_file(self) -> None:
         output_file = Path(self.output_file_var.get())
@@ -816,19 +1182,19 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
             messagebox.showerror("上传失败", "只支持 Excel 文件：.xls 或 .xlsx")
             return
         target_path = self._current_annual_target_path(suffix)
-        for old_suffix in (".xls", ".xlsx"):
-            old_path = self._current_annual_target_path(old_suffix)
-            if old_path.exists() and old_path != target_path:
-                old_path.unlink()
-        if target_path.exists() and not messagebox.askyesno("确认覆盖", "当前年假总数表已存在，是否用新文件覆盖？"):
+        existing_annual_files = _find_matching_files(data_dir, FILE_KIND_CONFIG["annual"]["patterns"])
+        if existing_annual_files and not messagebox.askyesno("确认覆盖", "当前年假总数表已存在，是否用新文件覆盖？"):
             return
-        if target_path.exists():
-            target_path.unlink()
+        for existing in existing_annual_files:
+            if existing.exists():
+                existing.unlink()
         shutil.copy2(source_path, target_path)
         self._refresh_annual_info()
         self.log(f"已上传当前年假表 -> {target_path}", SUCCESS)
         self.set_notice("当前年假表已更新。", "只有员工年假信息发生变化时，才需要再次上传。", "success")
-        self.scan_bundles(preserve_log=True)
+        self._scan_cache_key = None
+        self._folder_cache_key = None
+        self.refresh_folder_overview()
 
     def open_current_annual_file(self) -> None:
         try:
@@ -849,7 +1215,7 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
             return
         messagebox.showinfo("提示", "未找到使用说明文件。")
 
-    def _populate_bundles(self, bundles: list[MonthlySourceBundle]) -> None:
+    def _populate_bundles(self, bundles: list[MonthlySourceBundle], full_scan: bool = True) -> None:
         folder_rows, issues = self._inspect_month_folders()
         self.current_bundles = list(bundles)
         self.month_issue_details = {
@@ -857,12 +1223,13 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
             for row in folder_rows
             if row.get("detail")
         }
+        display_rows = [row for row in folder_rows if (not self.issue_only_var.get() or row.get("detail"))]
         self._refresh_year_values()
         for item in self.bundle_tree.get_children():
             self.bundle_tree.delete(item)
 
-        if folder_rows:
-            for row in folder_rows:
+        if display_rows:
+            for row in display_rows:
                 self.bundle_tree.insert(
                     "",
                     "end",
@@ -871,9 +1238,12 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
                         row["attendance"],
                         row["leave"],
                         row["status"],
+                        row["detail"],
                     ),
                     tags=(str(row["tag"]),),
                 )
+        elif folder_rows and self.issue_only_var.get():
+            pass
         else:
             for bundle in bundles:
                 self.bundle_tree.insert(
@@ -884,6 +1254,7 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
                         bundle.attendance_file.name,
                         bundle.leave_file.name,
                         "[已就绪]",
+                        "",
                     ),
                     tags=("ok",),
                 )
@@ -899,13 +1270,31 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
         except ValueError:
             pass
 
-        if issues:
+        ready_folder_count = sum(1 for row in folder_rows if row.get("tag") == "ok")
+
+        if issues and bundles:
+            self.status_var.set(f"已识别 {len(bundles)} 个月份，另有部分月份待处理。")
+            self.summary_var.set(f"当前可统计 {len(bundles)} 个月份，其余月份待处理")
+            self.set_notice(
+                "部分月份还需要处理。",
+                "已就绪的月份仍可先生成；显示 [需处理] 的月份可以稍后补齐。",
+                "info",
+            )
+        elif issues:
             self.status_var.set("有月份文件夹需要处理，请先补齐或去重。")
-            self.summary_var.set("有文件没放全或放重了，暂时不能生成")
+            self.summary_var.set("当前还没有完整月份可统计")
             self.set_notice(
                 "有月份文件夹还需要处理。",
                 "请看月份列表最右边“状态”这一列。哪里显示“缺少”或“重复”，就先处理哪里。",
                 "error",
+            )
+        elif not full_scan and ready_folder_count:
+            self.status_var.set(f"当前年份发现 {ready_folder_count} 个月份文件已就绪。")
+            self.summary_var.set("已完成轻量检查，点击“检查当前年份文件”可做完整识别")
+            self.set_notice(
+                "已完成轻量检查。",
+                f"当前年份发现 {ready_folder_count} 个已就绪月份。需要完整识别时，请点击“检查当前年份文件”。",
+                "info",
             )
         elif bundles:
             if not selected_folder or not (Path(self.data_dir_var.get()) / selected_folder).exists():
@@ -933,6 +1322,18 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
         _, issues = self._inspect_month_folders()
         return bool(issues)
 
+    def _selected_year_folder_issues(self) -> list[str]:
+        try:
+            year = self._get_selected_year()
+        except ValueError:
+            return []
+        rows, _ = self._inspect_month_folders()
+        return [
+            f"{row['month']}: {row['detail']}"
+            for row in rows
+            if str(row["month"]).startswith(f"{year}-") and row.get("detail")
+        ]
+
     def _get_next_month_folder_name(self) -> str:
         if self.current_bundles:
             latest = max(self.current_bundles, key=lambda item: (item.year, item.month))
@@ -946,11 +1347,7 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
         return f"{today.year}-{today.month:02d}"
 
     def _find_existing_month_files(self, month_dir: Path, kind: str) -> list[Path]:
-        return [
-            month_dir / file_name
-            for file_name in FILE_KIND_CONFIG[kind]["file_names"]
-            if (month_dir / file_name).exists()
-        ]
+        return _find_matching_files(month_dir, FILE_KIND_CONFIG[kind]["patterns"])
 
     def _find_existing_month_file(self, month_dir: Path, kind: str) -> Path | None:
         files = self._find_existing_month_files(month_dir, kind)
@@ -963,37 +1360,40 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
 
         rows: list[dict[str, object]] = []
         issues: list[str] = []
-        month_dirs = sorted([path for path in base_dir.iterdir() if path.is_dir()])
+        target_year = None
+        try:
+            target_year = self._get_selected_year()
+        except ValueError:
+            pass
 
-        for month_dir in month_dirs:
-            attendance_files = self._find_existing_month_files(month_dir, "attendance")
-            leave_files = self._find_existing_month_files(month_dir, "leave")
-
-            problems = []
-            if not attendance_files:
-                problems.append("缺少考勤文件")
-            elif len(attendance_files) > 1:
-                problems.append("重复考勤文件")
-            if not leave_files:
-                problems.append("缺少请假文件")
-            elif len(leave_files) > 1:
-                problems.append("重复请假文件")
-
-            if problems:
-                status_text = "[需处理]"
-                issues.append(f"{month_dir.name}: {', '.join(problems)}")
-                detail_text = "；".join(problems)
-                tag = "warn"
-            else:
+        inspections = self._get_folder_inspections(target_year)
+        for item in inspections:
+            attendance_count = len(item.attendance_files)
+            leave_count = len(item.leave_files)
+            if item.ready:
                 status_text = "[已就绪]"
                 detail_text = ""
                 tag = "ok"
+            elif attendance_count == 0 and leave_count == 0:
+                status_text = "[未放文件]"
+                detail_text = item.detail or "还没有识别到考勤或请假文件"
+                tag = "empty"
+            elif "重复" in item.detail:
+                status_text = "[文件重复]"
+                detail_text = item.detail
+                tag = "warn"
+            else:
+                status_text = "[已放1个文件]"
+                detail_text = item.detail or "该月文件还不完整"
+                tag = "partial"
+            if detail_text:
+                issues.append(f"{item.folder_name}: {detail_text}")
 
             rows.append(
                 {
-                    "month": month_dir.name,
-                    "attendance": attendance_files[0].name if len(attendance_files) == 1 else ("未放" if not attendance_files else f"{len(attendance_files)}个文件"),
-                    "leave": leave_files[0].name if len(leave_files) == 1 else ("未放" if not leave_files else f"{len(leave_files)}个文件"),
+                    "month": item.folder_name,
+                    "attendance": item.attendance_files[0].name if len(item.attendance_files) == 1 else ("未放" if not item.attendance_files else f"{len(item.attendance_files)}个文件"),
+                    "leave": item.leave_files[0].name if len(item.leave_files) == 1 else ("未放" if not item.leave_files else f"{len(item.leave_files)}个文件"),
                     "status": status_text,
                     "detail": detail_text,
                     "tag": tag,
@@ -1105,11 +1505,7 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
         if suffix not in {".xls", ".xlsx"}:
             raise ValueError("只支持 Excel 文件：.xls 或 .xlsx")
 
-        existing_files = [
-            month_dir / file_name
-            for file_name in FILE_KIND_CONFIG[kind]["file_names"]
-            if (month_dir / file_name).exists()
-        ]
+        existing_files = self._find_existing_month_files(month_dir, kind)
         if existing_files:
             overwrite = messagebox.askyesno(
                 "确认覆盖",
@@ -1157,7 +1553,9 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
             f"文件已放入 {month_dir.name}。如果本月 2 个文件都放好了，下一步直接点击“生成结果文件”。",
             "success",
         )
-        self.scan_bundles(preserve_log=True)
+        self._scan_cache_key = None
+        self._folder_cache_key = None
+        self.refresh_folder_overview()
 
     def upload_all_monthly_files(self) -> None:
         month_dir = self._ensure_selected_month_dir_or_warn()
@@ -1215,7 +1613,9 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
             "现在可以直接点击中间的“生成结果文件”。程序会自动检查后再生成。",
             "success",
         )
-        self.scan_bundles(preserve_log=True)
+        self._scan_cache_key = None
+        self._folder_cache_key = None
+        self.refresh_folder_overview()
 
     def create_next_month_folder(self) -> None:
         base_dir = Path(self.data_dir_var.get())
@@ -1256,15 +1656,61 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
             "现在请把这个月的 2 个 Excel 文件放进去。年假表只在变化时单独更新。",
             "info",
         )
+        self._scan_cache_key = None
+        self._folder_cache_key = None
+        self.refresh_folder_overview()
         _open_path(month_dir)
 
     def scan_bundles(self, preserve_log: bool = False) -> None:
+        if self._closing:
+            return
+        started_at = time.perf_counter()
         data_dir = Path(self.data_dir_var.get())
+        selected_year = None
         try:
-            bundles = discover_monthly_source_bundles(str(data_dir))
+            selected_year = self._get_selected_year()
+        except ValueError:
+            pass
+        cache_key = self._build_scan_cache_key(data_dir, selected_year)
+        if self._scan_cache_key == cache_key:
+            self._last_scan_duration_seconds = time.perf_counter() - started_at
+            self._last_scan_used_cache = True
+            self._last_scan_feedback = f"自上次完整检查后未发现文件变化，本次直接复用结果。{self._format_scan_duration(self._last_scan_duration_seconds)}"
+            self.last_scan_error_message = self._scan_cache_error
+            self._refresh_annual_info()
+            self._populate_bundles(self._scan_cache_bundles, full_scan=True)
+            if not preserve_log:
+                self.clear_log()
+                self.log(f"放文件的文件夹：{data_dir}", MUTED)
+                self.log("检查结果来自缓存，本次未重复读取 Excel。", SUCCESS)
+                try:
+                    annual_summary = get_current_annual_leave_summary(str(data_dir))
+                    self.log(f"当前年假表：{annual_summary['file_name']} | 员工数={annual_summary['employee_count']}", SUCCESS)
+                except Exception:
+                    self.log("当前年假表：未上传", ERROR)
+                for bundle in self._scan_cache_bundles:
+                    self.log(
+                        f"找到月份 {bundle.year}-{bundle.month:02d} | "
+                        f"{bundle.attendance_file.name} | {bundle.leave_file.name}",
+                        SUCCESS,
+                    )
+            return
+        previous_full_scan_key = self._last_full_scan_key
+        file_changed_since_last_scan = previous_full_scan_key is not None and previous_full_scan_key != cache_key
+        try:
+            bundles = discover_monthly_source_bundles(str(data_dir), target_year=selected_year, relaxed=True)
         except Exception as exc:
             friendly_message = _friendly_scan_error(exc)
-            self._populate_bundles([])
+            self._last_scan_duration_seconds = time.perf_counter() - started_at
+            self._last_scan_used_cache = False
+            prefix = "检测到文件变化，已重新检查。" if file_changed_since_last_scan else "已完成完整检查。"
+            self._last_scan_feedback = f"{prefix}{self._format_scan_duration(self._last_scan_duration_seconds)}"
+            self._scan_cache_key = cache_key
+            self._scan_cache_bundles = []
+            self._scan_cache_error = friendly_message
+            self._last_full_scan_key = cache_key
+            self.last_scan_error_message = friendly_message
+            self._populate_bundles([], full_scan=True)
             self._refresh_annual_info()
             self.status_var.set("检查失败，请先处理文件夹中的问题。")
             self.set_notice(
@@ -1277,6 +1723,43 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
             self.log(f"检查失败：{friendly_message}", ERROR)
             self.log(str(exc), MUTED)
             return
+
+        if not bundles:
+            ready_rows = [row for row in self._inspect_month_folders()[0] if row.get("tag") == "ok"]
+            if ready_rows:
+                try:
+                    discover_monthly_source_bundles(str(data_dir), target_year=selected_year, relaxed=False)
+                except Exception as exc:
+                    friendly_message = _friendly_scan_error(exc)
+                else:
+                    friendly_message = "已检测到月份文件，但未能识别出可统计的月份。请检查考勤表里的年月、请假表配套关系和文件内容。"
+                self._last_scan_duration_seconds = time.perf_counter() - started_at
+                self._last_scan_used_cache = False
+                prefix = "检测到文件变化，已重新检查。" if file_changed_since_last_scan else "已完成完整检查。"
+                self._last_scan_feedback = f"{prefix}{self._format_scan_duration(self._last_scan_duration_seconds)}"
+                self._scan_cache_key = cache_key
+                self._scan_cache_bundles = []
+                self._scan_cache_error = friendly_message
+                self._last_full_scan_key = cache_key
+                self.last_scan_error_message = friendly_message
+                self._refresh_annual_info()
+                self._populate_bundles([], full_scan=True)
+                self.status_var.set("已发现月份文件，但当前还不能识别成可统计月份。")
+                self.set_notice("当前文件还不能直接统计。", friendly_message, "error")
+                if not preserve_log:
+                    self.clear_log()
+                self.log(f"检查结果：{friendly_message}", ERROR)
+                return
+
+        self._scan_cache_key = cache_key
+        self._scan_cache_bundles = list(bundles)
+        self._scan_cache_error = ""
+        self._last_full_scan_key = cache_key
+        self._last_scan_duration_seconds = time.perf_counter() - started_at
+        self._last_scan_used_cache = False
+        prefix = "检测到文件变化，已重新检查。" if file_changed_since_last_scan else "已完成完整检查。"
+        self._last_scan_feedback = f"{prefix}{self._format_scan_duration(self._last_scan_duration_seconds)}"
+        self.last_scan_error_message = ""
 
         if not preserve_log:
             self.clear_log()
@@ -1293,44 +1776,52 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
                     SUCCESS,
                 )
         self._refresh_annual_info()
-        self._populate_bundles(bundles)
+        self._populate_bundles(bundles, full_scan=True)
 
     def run_report(self) -> None:
+        if self._closing:
+            return
         if self.run_thread and self.run_thread.is_alive():
             return
 
-        self.scan_bundles()
+        data_dir = Path(self.data_dir_var.get())
+        selected_year = self._get_selected_year()
+        cache_key = self._build_scan_cache_key(data_dir, selected_year)
+        generation_cache_reused = False
+        if self._scan_cache_key == cache_key:
+            generation_cache_reused = True
+            self._last_scan_used_cache = True
+            self.last_scan_error_message = self._scan_cache_error
+            self.current_bundles = list(self._scan_cache_bundles)
+        else:
+            self.scan_bundles()
+            generation_cache_reused = self._last_scan_used_cache
 
         if not self.current_bundles:
+            issue_lines = self._selected_year_folder_issues()
+            detail = self.last_scan_error_message or "请先上传当前年假表，并上传至少一个月份的 2 个表。"
+            if issue_lines:
+                detail = "当前选中年份还没有完整可统计的月份。\n\n" + "\n".join(issue_lines[:5])
             self.summary_var.set("还没有可统计的月份")
             self.status_var.set("请先上传当前年假表，并上传该月 2 个表。")
             self.set_notice(
                 "还没有找到可统计的月份。",
-                "请先上传当前年假表，再选好年份和月份，点击中间的“上传所选月份2个表”。",
+                detail,
                 "error",
             )
-            messagebox.showinfo("无法生成", "还没有找到可统计的月份。请先上传当前年假表，并上传至少一个月份的 2 个表。")
+            messagebox.showinfo("无法生成", f"还没有找到可统计的月份。\n\n{detail}")
             return
 
-        if self._has_folder_issues():
-            self.summary_var.set("有文件没放全，不能生成")
-            self.status_var.set("请先补齐月份列表里缺少的文件。")
-            self.set_notice(
-                "暂时不能生成。",
-                "月份列表里还有“缺少”或“重复”的项目，请先处理后再生成。",
-                "error",
-            )
-            messagebox.showwarning("无法生成", "还有月份文件夹缺少文件，请先补齐后再生成。")
-            return
-
-        data_dir = Path(self.data_dir_var.get())
         output_file = Path(self.output_file_var.get())
         output_file.parent.mkdir(parents=True, exist_ok=True)
 
         self.clear_log()
         self.log(f"开始生成统计。放文件的文件夹：{data_dir}", MUTED)
         self.log(f"结果会保存到：{output_file}", MUTED)
+        if generation_cache_reused:
+            self.log("生成前缓存有效，未重复执行完整检查。", SUCCESS)
         self.upload_button.configure(state="disabled")
+        self.check_button.configure(state="disabled")
         self.run_button.configure(state="disabled")
         self.summary_var.set("正在生成，请稍等 10-30 秒")
         self.set_notice(
@@ -1341,7 +1832,13 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
 
         def worker() -> None:
             try:
-                summary = generate_report(str(data_dir), str(output_file), logger=lambda msg: self.log_queue.put(("log", msg)))
+                summary = generate_report(
+                    str(data_dir),
+                    str(output_file),
+                    logger=lambda msg: self.log_queue.put(("log", msg)),
+                    target_year=selected_year,
+                    relaxed=True,
+                )
                 self.log_queue.put(("done", summary))
             except Exception:
                 self.log_queue.put(("error", traceback.format_exc()))
@@ -1350,6 +1847,8 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
         self.run_thread.start()
 
     def _poll_log_queue(self) -> None:
+        if self._closing:
+            return
         try:
             while True:
                 kind, payload = self.log_queue.get_nowait()
@@ -1366,7 +1865,7 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
                         f"保存位置：{summary.output_file}",
                         "success",
                     )
-                    messagebox.showinfo("生成完成", f"结果文件已生成：\n{summary.output_file}")
+                    self._show_generation_success_dialog(summary)
                     self.scan_bundles(preserve_log=True)
                 elif kind == "error":
                     self.log("生成失败：", ERROR)
@@ -1381,10 +1880,12 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
                     messagebox.showerror("生成失败", "统计过程中出现错误。\n请检查文件是否完整、文件名是否正确。")
                 if kind in {"done", "error"}:
                     self.upload_button.configure(state="normal")
+                    self.check_button.configure(state="normal")
                     self.run_button.configure(state="normal")
         except queue.Empty:
             pass
-        self.after(120, self._poll_log_queue)
+        if not self._closing:
+            self._poll_after_id = self.after(120, self._poll_log_queue)
 
 
 def main() -> None:

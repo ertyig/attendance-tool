@@ -246,6 +246,19 @@ class MonthlySourceBundle:
 
 
 @dataclass
+class MonthFolderInspection:
+    folder_name: str
+    year: int
+    month: int
+    attendance_files: List[Path]
+    leave_files: List[Path]
+    annual_files: List[Path]
+    detail: str
+    ready: bool
+    has_any_data: bool
+
+
+@dataclass
 class MonthlyProcessedResult:
     bundle: MonthlySourceBundle
     employee_name_by_id: Dict[str, str]
@@ -474,10 +487,9 @@ def resolve_current_annual_leave_file(root_dir: Path) -> Path:
     raise RuntimeError(f"{root_dir} 中找到多个当前年假文件，请只保留一个: {root_candidates}")
 
 
-def get_current_annual_leave_summary(data_dir: str = DATA_DIR) -> Dict[str, object]:
-    root_dir = Path(data_dir)
+def resolve_available_annual_leave_file(root_dir: Path) -> Path:
     try:
-        annual_file = resolve_current_annual_leave_file(root_dir)
+        return resolve_current_annual_leave_file(root_dir)
     except FileNotFoundError:
         month_candidates: List[Tuple[Tuple[int, int], Path]] = []
         child_dirs = sorted(root_dir.iterdir()) if root_dir.exists() else []
@@ -490,7 +502,12 @@ def get_current_annual_leave_summary(data_dir: str = DATA_DIR) -> Dict[str, obje
                 month_candidates.append((year_month, annual_files[0]))
         if not month_candidates:
             raise
-        annual_file = sorted(month_candidates, key=lambda item: item[0])[-1][1]
+        return sorted(month_candidates, key=lambda item: item[0])[-1][1]
+
+
+def get_current_annual_leave_summary(data_dir: str = DATA_DIR) -> Dict[str, object]:
+    root_dir = Path(data_dir)
+    annual_file = resolve_available_annual_leave_file(root_dir)
     annual_leave_df = read_annual_leave_file(str(annual_file))
     formal_employees = parse_formal_employee_leave_info(annual_leave_df)
     updated_at = datetime.fromtimestamp(annual_file.stat().st_mtime)
@@ -502,7 +519,11 @@ def get_current_annual_leave_summary(data_dir: str = DATA_DIR) -> Dict[str, obje
     }
 
 
-def _discover_monthly_bundles_from_subdirs(root_dir: Path) -> List[MonthlySourceBundle]:
+def _discover_monthly_bundles_from_subdirs(
+    root_dir: Path,
+    target_year: Optional[int] = None,
+    relaxed: bool = False,
+) -> List[MonthlySourceBundle]:
     bundles: List[MonthlySourceBundle] = []
     current_annual_leave_file: Optional[Path] = None
     month_dirs = []
@@ -520,6 +541,13 @@ def _discover_monthly_bundles_from_subdirs(root_dir: Path) -> List[MonthlySource
 
     seen_keys = set()
     for month_dir, attendance_files, leave_files, annual_files in month_dirs:
+        dir_year_month = _detect_year_month_from_dir_name(month_dir.name)
+        if target_year is not None and dir_year_month is not None and dir_year_month[0] != target_year:
+            continue
+
+        if relaxed and (len(attendance_files) != 1 or len(leave_files) != 1 or len(annual_files) > 1):
+            continue
+
         attendance_file = _pick_single_file(attendance_files, "考勤打卡", month_dir)
         leave_file = _pick_single_file(leave_files, "请假", month_dir)
         if len(annual_files) > 1:
@@ -528,19 +556,24 @@ def _discover_monthly_bundles_from_subdirs(root_dir: Path) -> List[MonthlySource
             annual_leave_file = annual_files[0]
         else:
             if current_annual_leave_file is None:
-                current_annual_leave_file = resolve_current_annual_leave_file(root_dir)
+                current_annual_leave_file = resolve_available_annual_leave_file(root_dir)
             annual_leave_file = current_annual_leave_file
 
         # 以考勤文件内容识别年月；如果目录名本身也像月份，则做一致性校验。
         sheet_map = read_input_file(str(attendance_file))
         detected_year, detected_month = resolve_target_year_month(sheet_map)
-        dir_year_month = _detect_year_month_from_dir_name(month_dir.name)
+        if target_year is not None and detected_year != target_year:
+            continue
         if dir_year_month is not None and (detected_year, detected_month) != dir_year_month:
+            if relaxed:
+                continue
             raise RuntimeError(
                 f"{attendance_file} 识别到的年月为 {detected_year}-{detected_month:02d}，"
                 f"与目录 {month_dir.name} 不一致。"
             )
         if (detected_year, detected_month) in seen_keys:
+            if relaxed:
+                continue
             raise RuntimeError(f"发现重复月份目录: {month_dir}")
         seen_keys.add((detected_year, detected_month))
 
@@ -555,6 +588,59 @@ def _discover_monthly_bundles_from_subdirs(root_dir: Path) -> List[MonthlySource
         )
 
     return bundles
+
+
+def inspect_month_source_folders(
+    data_dir: str = DATA_DIR,
+    target_year: Optional[int] = None,
+) -> List[MonthFolderInspection]:
+    root_dir = Path(data_dir)
+    if not root_dir.exists():
+        return []
+
+    rows: List[MonthFolderInspection] = []
+    for month_dir in sorted(root_dir.iterdir()):
+        if not month_dir.is_dir():
+            continue
+        year_month = _detect_year_month_from_dir_name(month_dir.name)
+        if year_month is None:
+            continue
+        year, month = year_month
+        if target_year is not None and year != target_year:
+            continue
+
+        attendance_files = _find_candidate_files(month_dir, ATTENDANCE_FILE_PATTERNS)
+        leave_files = _find_candidate_files(month_dir, LEAVE_FILE_PATTERNS)
+        annual_files = _find_candidate_files(month_dir, ANNUAL_LEAVE_FILE_PATTERNS)
+
+        problems: List[str] = []
+        if not attendance_files:
+            problems.append("缺少考勤文件")
+        elif len(attendance_files) > 1:
+            problems.append("重复考勤文件")
+        if not leave_files:
+            problems.append("缺少请假文件")
+        elif len(leave_files) > 1:
+            problems.append("重复请假文件")
+        if len(annual_files) > 1:
+            problems.append("重复年假文件")
+
+        has_any_data = bool(attendance_files or leave_files or annual_files or any(month_dir.iterdir()))
+        rows.append(
+            MonthFolderInspection(
+                folder_name=month_dir.name,
+                year=year,
+                month=month,
+                attendance_files=attendance_files,
+                leave_files=leave_files,
+                annual_files=annual_files,
+                detail="；".join(problems),
+                ready=not problems and len(attendance_files) == 1 and len(leave_files) == 1,
+                has_any_data=has_any_data,
+            )
+        )
+
+    return rows
 
 
 def _detect_leave_year_month(leave_df: pd.DataFrame, file_path: Path) -> Optional[Tuple[int, int]]:
@@ -606,15 +692,19 @@ def _choose_companion_file(
     )
 
 
-def discover_monthly_source_bundles(data_dir: str = DATA_DIR) -> List[MonthlySourceBundle]:
+def discover_monthly_source_bundles(
+    data_dir: str = DATA_DIR,
+    target_year: Optional[int] = None,
+    relaxed: bool = False,
+) -> List[MonthlySourceBundle]:
     root_dir = Path(data_dir)
     if not root_dir.exists():
         raise FileNotFoundError(f"数据目录不存在: {data_dir}")
 
-    monthly_dir_bundles = _discover_monthly_bundles_from_subdirs(root_dir)
+    monthly_dir_bundles = _discover_monthly_bundles_from_subdirs(root_dir, target_year=target_year, relaxed=relaxed)
     if monthly_dir_bundles:
         years = {bundle.year for bundle in monthly_dir_bundles}
-        if len(years) > 1:
+        if len(years) > 1 and target_year is None:
             raise RuntimeError(f"当前目录包含多个年份的月目录，请按年份分开处理: {sorted(years)}")
         return monthly_dir_bundles
 
@@ -633,32 +723,41 @@ def discover_monthly_source_bundles(data_dir: str = DATA_DIR) -> List[MonthlySou
     for attendance_path in attendance_candidates:
         sheet_map = read_input_file(str(attendance_path))
         year, month = resolve_target_year_month(sheet_map)
+        if target_year is not None and year != target_year:
+            continue
         key = (year, month)
         if key in bundles:
+            if relaxed:
+                continue
             raise RuntimeError(
                 f"发现重复月份的考勤文件: {bundles[key].attendance_file} 与 {attendance_path}"
             )
 
-        leave_path = _choose_companion_file(
-            year,
-            month,
-            attendance_path.parent,
-            leave_candidates,
-            leave_month_map,
-            Path(LEAVE_FILE),
-        )
-        annual_path = (
-            _choose_companion_file(
+        try:
+            leave_path = _choose_companion_file(
                 year,
                 month,
                 attendance_path.parent,
-                annual_candidates,
-                {path: _extract_year_month_from_text(path.stem) for path in annual_candidates},
-                Path(ANNUAL_LEAVE_FILE),
+                leave_candidates,
+                leave_month_map,
+                Path(LEAVE_FILE),
             )
-            if annual_candidates
-            else resolve_current_annual_leave_file(root_dir)
-        )
+            annual_path = (
+                _choose_companion_file(
+                    year,
+                    month,
+                    attendance_path.parent,
+                    annual_candidates,
+                    {path: _extract_year_month_from_text(path.stem) for path in annual_candidates},
+                    Path(ANNUAL_LEAVE_FILE),
+                )
+                if annual_candidates
+                else resolve_available_annual_leave_file(root_dir)
+            )
+        except Exception:
+            if relaxed:
+                continue
+            raise
         bundles[key] = MonthlySourceBundle(
             year=year,
             month=month,
@@ -668,7 +767,7 @@ def discover_monthly_source_bundles(data_dir: str = DATA_DIR) -> List[MonthlySou
         )
 
     years = {year for year, _ in bundles}
-    if len(years) > 1:
+    if len(years) > 1 and target_year is None:
         raise RuntimeError(f"当前目录包含多个年份的数据，请按年份分开处理: {sorted(years)}")
 
     return [bundles[key] for key in sorted(bundles)]
@@ -1949,20 +2048,25 @@ def generate_report(
     data_dir: str = DATA_DIR,
     output_file: str = OUTPUT_FILE,
     logger: Optional[Callable[[str], None]] = None,
+    target_year: Optional[int] = None,
+    relaxed: bool = False,
 ) -> ReportSummary:
     log = logger or (lambda _message: None)
 
-    bundles = discover_monthly_source_bundles(data_dir)
+    log("正在扫描可统计月份...")
+    bundles = discover_monthly_source_bundles(data_dir, target_year=target_year, relaxed=relaxed)
     if not bundles:
         raise RuntimeError("未发现可统计的月度文件。")
 
     year = bundles[0].year
+    log(f"已识别 {len(bundles)} 个月份，开始逐月汇总...")
     monthly_results: List[MonthlyProcessedResult] = []
     merged_employee_name_by_id: Dict[str, str] = {}
     annual_summary_by_emp: Dict[str, Dict[str, float]] = defaultdict(_new_summary_bucket)
     formal_employees: List[FormalEmployeeLeaveInfo] = []
 
-    for bundle in bundles:
+    for index, bundle in enumerate(bundles, start=1):
+        log(f"[{index}/{len(bundles)}] 正在处理 {bundle.year}-{bundle.month:02d}...")
         monthly_result = process_monthly_bundle(bundle)
         monthly_results.append(monthly_result)
         merged_employee_name_by_id.update(monthly_result.employee_name_by_id)
@@ -1970,14 +2074,18 @@ def generate_report(
         for emp_id, summary in monthly_result.summary_by_emp.items():
             for key, value in summary.items():
                 annual_summary_by_emp[emp_id][key] += float(value)
+        log(f"[{index}/{len(bundles)}] 已完成 {bundle.year}-{bundle.month:02d}")
 
+    log("正在汇总年度正式员工数据...")
     annual_formal_employees = merge_annual_formal_employees(monthly_results)
     annual_rows = build_annual_summary_rows(
         annual_formal_employees,
         merged_employee_name_by_id,
         dict(annual_summary_by_emp),
     )
+    log("正在写入 Excel 文件...")
     export_report(monthly_results, annual_rows, year, output_file)
+    log("正在整理导出结果...")
 
     log(f"已生成: {output_file}")
     log(f"统计年份: {year}")

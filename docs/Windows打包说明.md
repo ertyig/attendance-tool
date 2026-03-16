@@ -33,11 +33,14 @@
 
 - `attendance_gui.py`
 - `attendance_gui.spec`
+- `attendance_pyside6.py`
+- `attendance_pyside6.spec`
 - `attendance_customtkinter.py`
 - `attendance_customtkinter.spec`
 - `attendance_nicegui.py`
 - `attendance_nicegui.spec`
 - `打包Windows程序.bat`
+- `打包Windows程序_PySide6.bat`
 - `打包Windows程序_CustomTkinter.bat`
 - `打包Windows程序_NiceGUI.bat`
 - `一键环境检查.bat`
@@ -80,6 +83,14 @@
 
 - `build_windows_customtkinter.log`
 
+如果你要打包 PySide6 版本，双击：
+
+- `打包Windows程序_PySide6.bat`
+
+它会输出独立的 PySide6 版本 exe，并把日志写到：
+
+- `build_windows_pyside6.log`
+
 ---
 
 ## 四、打包成功后，exe 在哪里
@@ -95,6 +106,10 @@
 如果打的是 CustomTkinter 版本，默认会生成：
 
 - `dist\考勤统计助手_CustomTkinter.exe`
+
+如果打的是 PySide6 版本，默认会生成：
+
+- `dist\考勤统计助手_PySide6.exe`
 
 这个文件就是给同事双击运行的程序。
 
@@ -114,6 +129,13 @@ py -m PyInstaller --noconfirm --clean attendance_gui.spec
 ```bat
 py -m pip install --upgrade pip pyinstaller customtkinter pandas openpyxl xlrd holidays chinese-calendar
 py -m PyInstaller --noconfirm --clean attendance_customtkinter.spec
+```
+
+如果是 PySide6 版本，执行：
+
+```bat
+py -m pip install --upgrade pip pyinstaller PySide6 pandas openpyxl xlrd holidays chinese-calendar
+py -m PyInstaller --noconfirm --clean attendance_pyside6.spec
 ```
 
 如果是 NiceGUI 版本，执行：
@@ -136,10 +158,11 @@ py -m PyInstaller --noconfirm --clean attendance_nicegui.spec
 建议至少发下面这些内容：
 
 1. `考勤统计助手.exe`
-2. 或 `考勤统计助手_CustomTkinter.exe`
-2. 或 `财务公司考勤统计助手_NiceGUI.exe`
-3. `data/月度文件/`
-4. `使用说明-给同事看.txt`
+2. 或 `考勤统计助手_PySide6.exe`
+3. 或 `考勤统计助手_CustomTkinter.exe`
+4. 或 `财务公司考勤统计助手_NiceGUI.exe`
+5. `data/月度文件/`
+6. `使用说明-给同事看.txt`
 
 建议整理成一个完整文件夹发给同事，例如：
 
@@ -165,14 +188,18 @@ py -m PyInstaller --noconfirm --clean attendance_nicegui.spec
 
 建议在你自己的 Windows 电脑上先测试：
 
-1. 在 `data/月度文件/2026-02/` 下放入 3 个示例文件
-2. 双击运行 `考勤统计助手.exe`
-3. 或双击运行 `考勤统计助手_CustomTkinter.exe`
-4. 或双击运行 `财务公司考勤统计助手_NiceGUI.exe`
-5. 在程序里点击：
-   - `上传所选月份3个表`
+1. 先上传 1 个当前年假表
+2. 在 `data/月度文件/2026-02/` 下放入当月 2 个示例文件
+3. 双击运行 `考勤统计助手.exe`
+4. 或双击运行 `考勤统计助手_PySide6.exe`
+5. 或双击运行 `考勤统计助手_CustomTkinter.exe`
+6. 或双击运行 `财务公司考勤统计助手_NiceGUI.exe`
+7. 在程序里点击：
+   - `上传当前年假表`
+   - `上传所选月份2个表`
+   - `检查当前年份文件`
    - `生成结果文件`
-6. 检查是否成功生成：
+8. 检查是否成功生成：
    - `考勤统计结果.xlsx`
 
 如果这一步没问题，再把程序发给同事。
@@ -186,11 +213,13 @@ py -m PyInstaller --noconfirm --clean attendance_nicegui.spec
 她只需要：
 
 1. 双击 `考勤统计助手.exe`
-2. 或双击 `考勤统计助手_CustomTkinter.exe`
-3. 或双击 `财务公司考勤统计助手_NiceGUI.exe`
-4. 在程序里选择年份和月份
-5. 点击 `上传所选月份3个表`
-6. 点击 `生成结果文件`
+2. 或双击 `考勤统计助手_PySide6.exe`
+3. 或双击 `考勤统计助手_CustomTkinter.exe`
+4. 或双击 `财务公司考勤统计助手_NiceGUI.exe`
+5. 在程序里选择年份和月份
+6. 点击 `上传当前年假表`
+7. 点击 `上传所选月份2个表`
+8. 点击 `生成结果文件`
 
 ---
 
@@ -200,9 +229,10 @@ py -m PyInstaller --noconfirm --clean attendance_nicegui.spec
 
 1. 用最新代码覆盖项目文件
 2. 在 Windows 上重新双击 `打包Windows程序.bat`
-3. 或重新双击 `打包Windows程序_CustomTkinter.bat`
-4. 或重新双击 `打包Windows程序_NiceGUI.bat`
-5. 把新的 exe 发给同事
+3. 或重新双击 `打包Windows程序_PySide6.bat`
+4. 或重新双击 `打包Windows程序_CustomTkinter.bat`
+5. 或重新双击 `打包Windows程序_NiceGUI.bat`
+6. 把新的 exe 发给同事
 
 ---
 
@@ -222,6 +252,12 @@ py -m pip install --upgrade pip pyinstaller ttkbootstrap pandas openpyxl xlrd ho
 py -m pip install --upgrade pip pyinstaller customtkinter pandas openpyxl xlrd holidays chinese-calendar
 ```
 
+如果是 PySide6 版本，先执行：
+
+```bat
+py -m pip install --upgrade pip pyinstaller PySide6 pandas openpyxl xlrd holidays chinese-calendar
+```
+
 ---
 
 ### 2. exe 能打开，但没有结果
@@ -229,11 +265,11 @@ py -m pip install --upgrade pip pyinstaller customtkinter pandas openpyxl xlrd h
 请检查：
 
 1. `data/月度文件/` 下面是否有月份文件夹
-2. 每个月份文件夹里是否有 3 个文件
-3. 文件名是否正确：
-   - `考勤打卡记录表.xls`
-   - `请假记录表.xls`
-   - `员工年假总数表.xlsx`
+2. 是否已经上传当前年假表
+3. 每个月份文件夹里是否有 2 个文件
+4. 文件名是否至少包含：
+   - `考勤`
+   - `请假`
 
 ---
 
