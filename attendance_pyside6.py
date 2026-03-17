@@ -26,11 +26,13 @@ from attendance_report import (
     OUTPUT_FILE,
     MonthFolderInspection,
     MonthlySourceBundle,
+    RefreshSummary,
     ReportSummary,
     discover_monthly_source_bundles,
     generate_report,
     get_current_annual_leave_summary,
     inspect_month_source_folders,
+    refresh_existing_result_workbook,
 )
 
 APP_NAME = "考勤统计助手"
@@ -215,12 +217,34 @@ class ReportWorker(QtCore.QRunnable):
             self.signals.error.emit(traceback.format_exc())
 
 
+class RefreshWorkbookWorker(QtCore.QRunnable):
+    def __init__(self, output_file: str) -> None:
+        super().__init__()
+        self.signals = WorkerSignals()
+        self.output_file = output_file
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        try:
+            summary = refresh_existing_result_workbook(
+                self.output_file,
+                logger=lambda msg: self.signals.message.emit(str(msg)),
+            )
+            self.signals.done.emit(summary)
+        except Exception:
+            self.signals.error.emit(traceback.format_exc())
+
+
 class AttendancePySide6Window(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION} | PySide6")
-        self.resize(1260, 940)
-        self.setMinimumSize(1120, 860)
+        screen = QtGui.QGuiApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else QtCore.QRect(0, 0, 1280, 900)
+        target_w = min(1260, max(980, available.width() - 80))
+        target_h = min(940, max(720, available.height() - 120))
+        self.resize(target_w, target_h)
+        self.setMinimumSize(940, 700)
 
         self.data_dir = _default_data_dir()
         self.output_file = _default_output_file()
@@ -324,9 +348,17 @@ class AttendancePySide6Window(QtWidgets.QMainWindow):
         root.addWidget(self.summary_label)
         root.addWidget(self.status_label)
 
-        body = QtWidgets.QHBoxLayout()
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        root.addWidget(scroll, 1)
+
+        scroll_content = QtWidgets.QWidget()
+        scroll.setWidget(scroll_content)
+
+        body = QtWidgets.QHBoxLayout(scroll_content)
+        body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(16)
-        root.addLayout(body, 1)
 
         left = QtWidgets.QVBoxLayout()
         left.setSpacing(16)
@@ -424,6 +456,9 @@ class AttendancePySide6Window(QtWidgets.QMainWindow):
         month_layout.addWidget(status_card)
 
         helper_row = QtWidgets.QHBoxLayout()
+        btn_refresh = QtWidgets.QPushButton("刷新结果汇总")
+        btn_refresh.setObjectName("ghostAction")
+        btn_refresh.clicked.connect(self.refresh_existing_result_file)
         btn_open_month = QtWidgets.QPushButton("打开所选月份文件夹")
         btn_open_month.setObjectName("ghostAction")
         btn_open_month.clicked.connect(self.open_selected_month_folder)
@@ -433,6 +468,7 @@ class AttendancePySide6Window(QtWidgets.QMainWindow):
         btn_log = QtWidgets.QPushButton("打开运行日志")
         btn_log.setObjectName("ghostAction")
         btn_log.clicked.connect(self.open_runtime_log)
+        helper_row.addWidget(btn_refresh)
         helper_row.addWidget(btn_open_month)
         helper_row.addWidget(btn_open_data)
         helper_row.addWidget(btn_log)
@@ -744,6 +780,20 @@ class AttendancePySide6Window(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "提示", "结果文件还没有生成。")
             return
         _open_path(self.output_file)
+
+    def _resolve_refresh_output_file(self) -> Path | None:
+        if self.output_file.exists():
+            return self.output_file
+        selected, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "请选择之前生成的结果文件",
+            str(_app_root()),
+            "Excel 文件 (*.xlsx);;所有文件 (*.*)",
+        )
+        if not selected:
+            return None
+        self.output_file = Path(selected)
+        return self.output_file
 
     def open_current_annual_file(self) -> None:
         try:
@@ -1061,6 +1111,27 @@ class AttendancePySide6Window(QtWidgets.QMainWindow):
         worker.signals.error.connect(self._on_report_error)
         self._thread_pool.start(worker)
 
+    def refresh_existing_result_file(self) -> None:
+        if self._current_worker is not None:
+            return
+        output_file = self._resolve_refresh_output_file()
+        if output_file is None:
+            return
+        self.clear_log()
+        self.log(f"开始刷新已有结果文件汇总：{output_file}")
+        for button in (self.upload_button, self.check_button, self.run_button, self.open_button):
+            button.setEnabled(False)
+        self.summary_label.setText("正在刷新已有结果文件汇总")
+        self.status_label.setText("程序会根据结果文件中的“考勤明细”sheet重算月度和年度汇总。")
+        self._set_notice("正在刷新已有结果文件汇总。", "如果你刚在 Excel 里改过某个月的考勤明细，请等待刷新完成。", "info")
+
+        worker = RefreshWorkbookWorker(str(output_file))
+        self._current_worker = worker
+        worker.signals.message.connect(self.log)
+        worker.signals.done.connect(self._on_refresh_done)
+        worker.signals.error.connect(self._on_refresh_error)
+        self._thread_pool.start(worker)
+
     def _on_report_done(self, summary: object) -> None:
         assert isinstance(summary, ReportSummary)
         self.log("统计完成。")
@@ -1069,7 +1140,7 @@ class AttendancePySide6Window(QtWidgets.QMainWindow):
         self._set_notice("结果文件已生成完成。", f"保存位置：{summary.output_file}", "success")
         self._show_generation_success_dialog(summary)
         self._current_worker = None
-        for button in (self.upload_button, self.check_button, self.run_button):
+        for button in (self.upload_button, self.check_button, self.run_button, self.open_button):
             button.setEnabled(True)
         self.scan_bundles(preserve_log=True)
 
@@ -1081,7 +1152,34 @@ class AttendancePySide6Window(QtWidgets.QMainWindow):
         self._set_notice("生成失败。", "请检查当前年假表和各月份的 2 个文件是否完整、文件名是否正确。", "error")
         QtWidgets.QMessageBox.critical(self, "生成失败", "统计过程中出现错误。\n请检查文件是否完整、文件名是否正确。")
         self._current_worker = None
-        for button in (self.upload_button, self.check_button, self.run_button):
+        for button in (self.upload_button, self.check_button, self.run_button, self.open_button):
+            button.setEnabled(True)
+
+    def _on_refresh_done(self, summary: object) -> None:
+        assert isinstance(summary, RefreshSummary)
+        refreshed_months = "、".join(f"{year}-{month:02d}" for year, month in summary.refreshed_months) or "无"
+        self.log("已有结果文件汇总刷新完成。")
+        self.summary_label.setText(f"已刷新 {len(summary.refreshed_months)} 个月份的月度/年度汇总")
+        self.status_label.setText(f"结果文件已更新：{summary.output_file}")
+        self._set_notice("已有结果文件汇总已刷新。", f"已刷新月份：{refreshed_months}", "success")
+        QtWidgets.QMessageBox.information(
+            self,
+            "刷新完成",
+            f"已有结果文件汇总已刷新。\n\n结果文件：{summary.output_file}\n已刷新年份：{'、'.join(str(year) for year in summary.years)}\n已刷新月份：{refreshed_months}",
+        )
+        self._current_worker = None
+        for button in (self.upload_button, self.check_button, self.run_button, self.open_button):
+            button.setEnabled(True)
+
+    def _on_refresh_error(self, payload: str) -> None:
+        self.log("刷新汇总失败：")
+        self.log(str(payload))
+        self.summary_label.setText("刷新汇总失败，请检查结果文件")
+        self.status_label.setText("刷新失败，请检查结果文件是否被占用或内容是否完整。")
+        self._set_notice("刷新已有结果文件汇总失败。", "请检查结果文件是否已关闭、sheet 名称是否完整。", "error")
+        QtWidgets.QMessageBox.critical(self, "刷新失败", "刷新已有结果文件汇总时出现错误。\n请检查结果文件是否已关闭、sheet 名称是否完整。")
+        self._current_worker = None
+        for button in (self.upload_button, self.check_button, self.run_button, self.open_button):
             button.setEnabled(True)
 
     def open_selected_month_folder(self) -> None:

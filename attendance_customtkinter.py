@@ -35,11 +35,13 @@ from attendance_report import (
     MonthFolderInspection,
     OUTPUT_FILE,
     MonthlySourceBundle,
+    RefreshSummary,
     ReportSummary,
     discover_monthly_source_bundles,
     generate_report,
     get_current_annual_leave_summary,
     inspect_month_source_folders,
+    refresh_existing_result_workbook,
 )
 
 APP_NAME = "考勤统计助手"
@@ -200,8 +202,12 @@ class AttendanceCustomTkinter(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         self.title(f"{APP_NAME} {APP_VERSION} | CustomTkinter")
-        self.geometry("1220x960")
-        self.minsize(1100, 860)
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        target_w = min(1220, max(980, screen_w - 80))
+        target_h = min(960, max(720, screen_h - 120))
+        self.geometry(f"{target_w}x{target_h}")
+        self.minsize(940, 700)
         self.configure(fg_color=APP_BG)
 
         self.data_dir_var = tk.StringVar(value=str(_default_data_dir()))
@@ -554,6 +560,38 @@ class AttendanceCustomTkinter(ctk.CTk):
         ctk.CTkButton(btn_row, text="打开结果文件夹", command=lambda: (_open_path(summary.output_file.parent), dialog.destroy()), width=130, height=38, corner_radius=10, fg_color="#E7EEF4", text_color="#41586F", hover_color="#D8E2EA").grid(row=0, column=1, padx=(0, 8))
         ctk.CTkButton(btn_row, text="关闭", command=dialog.destroy, width=90, height=38, corner_radius=10, fg_color="#EFF4F8", text_color="#4F657B", hover_color="#E3EBF1").grid(row=0, column=2)
 
+    def _show_refresh_success_dialog(self, summary: RefreshSummary) -> None:
+        refreshed_months = [f"{year}-{month:02d}" for year, month in summary.refreshed_months]
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("刷新完成")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.geometry("560x300")
+        dialog.resizable(False, False)
+
+        box = ctk.CTkFrame(dialog, fg_color="#FFFFFF", corner_radius=14, border_width=1, border_color=BORDER)
+        box.pack(fill="both", expand=True, padx=18, pady=18)
+        ctk.CTkLabel(box, text="已有结果文件汇总已刷新", text_color=TEXT, font=ctk.CTkFont(family="Microsoft YaHei UI", size=16, weight="bold")).pack(anchor="w", padx=18, pady=(18, 8))
+        ctk.CTkLabel(
+            box,
+            text="\n".join(
+                [
+                    f"结果文件：{summary.output_file}",
+                    f"已刷新年份：{'、'.join(str(year) for year in summary.years)}",
+                    f"已刷新月份：{'、'.join(refreshed_months) if refreshed_months else '无'}",
+                ]
+            ),
+            text_color=TEXT,
+            justify="left",
+            anchor="w",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=11),
+        ).pack(anchor="w", padx=18)
+        btn_row = ctk.CTkFrame(box, fg_color="transparent")
+        btn_row.pack(anchor="e", padx=18, pady=(16, 18))
+        ctk.CTkButton(btn_row, text="打开 Excel", command=lambda: (_open_path(summary.output_file), dialog.destroy()), width=120, height=38, corner_radius=10, fg_color=PRIMARY, hover_color=PRIMARY_DARK).grid(row=0, column=0, padx=(0, 8))
+        ctk.CTkButton(btn_row, text="打开结果文件夹", command=lambda: (_open_path(summary.output_file.parent), dialog.destroy()), width=130, height=38, corner_radius=10, fg_color="#E7EEF4", text_color="#41586F", hover_color="#D8E2EA").grid(row=0, column=1, padx=(0, 8))
+        ctk.CTkButton(btn_row, text="关闭", command=dialog.destroy, width=90, height=38, corner_radius=10, fg_color="#EFF4F8", text_color="#4F657B", hover_color="#E3EBF1").grid(row=0, column=2)
+
     def _build_ui(self) -> None:
         header = ctk.CTkFrame(self, fg_color=HEADER_BG, corner_radius=0, height=86)
         header.pack(fill="x")
@@ -566,11 +604,11 @@ class AttendanceCustomTkinter(ctk.CTk):
         ctk.CTkLabel(inner, text=APP_NAME, text_color="#F7FBFD", font=ctk.CTkFont(family="Microsoft YaHei UI", size=24, weight="bold")).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(inner, text=f"CustomTkinter 版本  {APP_VERSION}", text_color="#D4E4EA", font=ctk.CTkFont(family="Microsoft YaHei UI", size=11)).grid(row=1, column=0, sticky="w", pady=(2, 0))
 
-        body = ctk.CTkFrame(self, fg_color="transparent")
+        body = ctk.CTkScrollableFrame(self, fg_color="transparent", corner_radius=0)
         body.pack(fill="both", expand=True, padx=20, pady=14)
         body.grid_columnconfigure(0, weight=1)
         body.grid_rowconfigure(3, weight=0)
-        body.grid_rowconfigure(4, weight=1)
+        body.grid_rowconfigure(4, weight=0)
 
         self.notice_card = ctk.CTkFrame(body, fg_color=INFO_SOFT, corner_radius=16, border_width=1, border_color="#D5E3EE")
         self.notice_card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
@@ -643,9 +681,10 @@ class AttendanceCustomTkinter(ctk.CTk):
 
         link_row = ctk.CTkFrame(box, fg_color="transparent")
         link_row.grid(row=5, column=0, columnspan=6, pady=(0, 8))
-        ctk.CTkButton(link_row, text="打开所选月份文件夹", command=self.open_selected_month_folder, width=156, height=34, corner_radius=10, fg_color="#EFF4F8", text_color="#4F657B", hover_color="#E3EBF1").grid(row=0, column=0, padx=6)
-        ctk.CTkButton(link_row, text="打开放文件夹", command=self.open_data_dir, width=126, height=34, corner_radius=10, fg_color="#EFF4F8", text_color="#4F657B", hover_color="#E3EBF1").grid(row=0, column=1, padx=6)
-        ctk.CTkButton(link_row, text="打开运行日志", command=self.open_runtime_log, width=126, height=34, corner_radius=10, fg_color="#EFF4F8", text_color="#4F657B", hover_color="#E3EBF1").grid(row=0, column=2, padx=6)
+        ctk.CTkButton(link_row, text="刷新结果汇总", command=self.refresh_existing_result_file, width=126, height=34, corner_radius=10, fg_color="#EFF4F8", text_color="#4F657B", hover_color="#E3EBF1").grid(row=0, column=0, padx=6)
+        ctk.CTkButton(link_row, text="打开所选月份文件夹", command=self.open_selected_month_folder, width=156, height=34, corner_radius=10, fg_color="#EFF4F8", text_color="#4F657B", hover_color="#E3EBF1").grid(row=0, column=1, padx=6)
+        ctk.CTkButton(link_row, text="打开放文件夹", command=self.open_data_dir, width=126, height=34, corner_radius=10, fg_color="#EFF4F8", text_color="#4F657B", hover_color="#E3EBF1").grid(row=0, column=2, padx=6)
+        ctk.CTkButton(link_row, text="打开运行日志", command=self.open_runtime_log, width=126, height=34, corner_radius=10, fg_color="#EFF4F8", text_color="#4F657B", hover_color="#E3EBF1").grid(row=0, column=3, padx=6)
 
         info = ctk.CTkFrame(card, fg_color=CARD_ALT, corner_radius=14, border_width=1, border_color=BORDER)
         info.grid(row=5, column=0, sticky="ew", padx=14, pady=(0, 12))
@@ -819,6 +858,21 @@ class AttendanceCustomTkinter(ctk.CTk):
             return
         _open_path(output_file)
 
+    def _resolve_refresh_output_file(self) -> Path | None:
+        output_file = Path(self.output_file_var.get())
+        if output_file.exists():
+            return output_file
+        selected = filedialog.askopenfilename(
+            title="请选择之前生成的结果文件",
+            initialdir=str(_app_root()),
+            filetypes=[("Excel 文件", "*.xlsx"), ("所有文件", "*.*")],
+        )
+        if not selected:
+            return None
+        output_file = Path(selected)
+        self.output_file_var.set(str(output_file))
+        return output_file
+
     def _current_annual_target_path(self, suffix: str = ".xlsx") -> Path:
         data_dir = Path(self.data_dir_var.get())
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -872,6 +926,38 @@ class AttendanceCustomTkinter(ctk.CTk):
             messagebox.showinfo("提示", "当前还没有上传年假总数表。")
             return
         _open_path(Path(summary["path"]))
+
+    def refresh_existing_result_file(self) -> None:
+        if self._closing:
+            return
+        if self.run_thread and self.run_thread.is_alive():
+            return
+        output_file = self._resolve_refresh_output_file()
+        if output_file is None:
+            return
+
+        self.clear_log()
+        self.log(f"开始刷新已有结果文件汇总：{output_file}")
+        self.upload_button.configure(state="disabled")
+        self.check_button.configure(state="disabled")
+        self.run_button.configure(state="disabled")
+        self.open_button.configure(state="disabled")
+        self.summary_var.set("正在刷新已有结果文件汇总")
+        self.status_var.set("程序会根据结果文件中的“考勤明细”sheet重算月度和年度汇总。")
+        self.set_notice("正在刷新已有结果文件汇总。", "如果你刚在 Excel 里改过某个月的考勤明细，请等待刷新完成。", "info")
+
+        def worker() -> None:
+            try:
+                summary = refresh_existing_result_workbook(
+                    str(output_file),
+                    logger=lambda msg: self.log_queue.put(("log", msg)),
+                )
+                self.log_queue.put(("refresh_done", summary))
+            except Exception:
+                self.log_queue.put(("refresh_error", traceback.format_exc()))
+
+        self.run_thread = threading.Thread(target=worker, daemon=True)
+        self.run_thread.start()
 
     def open_usage_file(self) -> None:
         usage_file = _detailed_usage_file()
@@ -1374,6 +1460,14 @@ class AttendanceCustomTkinter(ctk.CTk):
                     self.set_notice("结果文件已生成完成。", f"保存位置：{summary.output_file}", "success")
                     self._show_generation_success_dialog(summary)
                     self.scan_bundles(preserve_log=True)
+                elif kind == "refresh_done":
+                    summary = payload
+                    assert isinstance(summary, RefreshSummary)
+                    self.log("已有结果文件汇总刷新完成。")
+                    self.summary_var.set(f"已刷新 {len(summary.refreshed_months)} 个月份的月度/年度汇总")
+                    self.status_var.set(f"结果文件已更新：{summary.output_file}")
+                    self.set_notice("已有结果文件汇总已刷新。", f"保存位置：{summary.output_file}", "success")
+                    self._show_refresh_success_dialog(summary)
                 elif kind == "error":
                     self.log("生成失败：")
                     self.log(str(payload))
@@ -1381,10 +1475,18 @@ class AttendanceCustomTkinter(ctk.CTk):
                     self.status_var.set("生成失败，请检查文件是否完整、文件名是否正确。")
                     self.set_notice("生成失败。", "请检查当前年假表和各月份的 2 个文件是否完整、文件名是否正确。", "error")
                     messagebox.showerror("生成失败", "统计过程中出现错误。\n请检查文件是否完整、文件名是否正确。")
-                if kind in {"done", "error"}:
+                elif kind == "refresh_error":
+                    self.log("刷新汇总失败：")
+                    self.log(str(payload))
+                    self.summary_var.set("刷新汇总失败，请检查结果文件")
+                    self.status_var.set("刷新失败，请检查结果文件是否被占用或内容是否完整。")
+                    self.set_notice("刷新已有结果文件汇总失败。", "请检查结果文件是否已关闭、sheet 名称是否完整。", "error")
+                    messagebox.showerror("刷新失败", "刷新已有结果文件汇总时出现错误。\n请检查结果文件是否已关闭、sheet 名称是否完整。")
+                if kind in {"done", "refresh_done", "error", "refresh_error"}:
                     self.upload_button.configure(state="normal")
                     self.check_button.configure(state="normal")
                     self.run_button.configure(state="normal")
+                    self.open_button.configure(state="normal")
         except queue.Empty:
             pass
         if not self._closing:

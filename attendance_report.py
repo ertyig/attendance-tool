@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -275,6 +275,13 @@ class ReportSummary:
     year: int
     monthly_results: List[MonthlyProcessedResult]
     formal_employee_count: int
+    output_file: Path
+
+
+@dataclass
+class RefreshSummary:
+    years: List[int]
+    refreshed_months: List[Tuple[int, int]]
     output_file: Path
 
 
@@ -1333,6 +1340,20 @@ def get_monthly_summary_sheet_name(year: int, month: int) -> str:
     return MONTHLY_SUMMARY_SHEET_NAME_TEMPLATE.format(year=year, month=month)
 
 
+def parse_monthly_detail_sheet_name(sheet_name: str) -> Optional[Tuple[int, int]]:
+    match = re.fullmatch(r"(\d{4})-(\d{2})考勤明细", _clean_text(sheet_name))
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def parse_monthly_summary_sheet_name(sheet_name: str) -> Optional[Tuple[int, int]]:
+    match = re.fullmatch(r"(\d{4})-(\d{2})月度统计", _clean_text(sheet_name))
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
 def _parse_monthly_summary_sheet_name(sheet_name: str) -> Optional[Tuple[int, int]]:
     match = re.fullmatch(r"(\d{4})-(\d{2})月度统计", _clean_text(sheet_name))
     if not match:
@@ -1725,6 +1746,319 @@ def merge_annual_formal_employees(
         return (1, item.seq, item.seq, item.name)
 
     return sorted(merged_by_name.values(), key=_sort_key)
+
+
+def _parse_existing_formal_summary_rows(ws) -> Tuple[List[FormalEmployeeLeaveInfo], Dict[str, str]]:
+    if ws.max_row < 4:
+        return [], {}
+
+    header_row = 3
+    header_map = {
+        _strip_unit_suffix(ws.cell(row=header_row, column=col_idx).value): col_idx
+        for col_idx in range(1, ws.max_column + 1)
+    }
+    seq_col = header_map.get("序号")
+    id_col = header_map.get("工号")
+    name_col = header_map.get("姓名")
+    annual_total_col = header_map.get("年假总天数")
+    if name_col is None:
+        return [], {}
+
+    formal_employees: List[FormalEmployeeLeaveInfo] = []
+    employee_name_by_id: Dict[str, str] = {}
+    fallback_seq = 1
+    for row_idx in range(header_row + 1, ws.max_row + 1):
+        name = _clean_text(ws.cell(row=row_idx, column=name_col).value)
+        if not name:
+            continue
+        emp_id = _clean_text(ws.cell(row=row_idx, column=id_col).value) if id_col else ""
+        seq_text = _clean_text(ws.cell(row=row_idx, column=seq_col).value) if seq_col else ""
+        annual_total = _safe_float(ws.cell(row=row_idx, column=annual_total_col).value, 0.0) if annual_total_col else 0.0
+        seq = int(_safe_float(seq_text, fallback_seq)) if seq_text else fallback_seq
+        formal_employees.append(FormalEmployeeLeaveInfo(seq=seq, name=name, annual_leave_total=annual_total))
+        if emp_id and emp_id not in employee_name_by_id:
+            employee_name_by_id[emp_id] = name
+        fallback_seq = max(fallback_seq + 1, seq + 1)
+
+    return formal_employees, employee_name_by_id
+
+
+def _parse_detail_sheet_employee_headers(ws) -> Dict[str, str]:
+    employee_name_by_id: Dict[str, str] = {}
+    if ws.max_row < 3 or ws.max_column < 4:
+        return employee_name_by_id
+    for col_idx in range(4, ws.max_column + 1):
+        emp_id = _clean_text(ws.cell(row=2, column=col_idx).value)
+        emp_name = _clean_text(ws.cell(row=3, column=col_idx).value)
+        if not emp_id or not emp_name:
+            continue
+        employee_name_by_id[emp_id] = emp_name
+    return employee_name_by_id
+
+
+def _apply_half_status_to_bucket(summary: Dict[str, float], half_text: str) -> None:
+    token = re.sub(r"^(上午|下午)", "", _clean_text(half_text))
+    if not token:
+        return
+    if token == "正常":
+        summary["正常数"] += 0.5
+        return
+    if token == "未打卡":
+        summary["未打卡"] += 0.5
+        return
+    normalized_leave = _normalize_leave_type(token)
+    if normalized_leave:
+        summary[normalized_leave] += 0.5
+
+
+def _apply_display_status_to_bucket(summary: Dict[str, float], display_status: object) -> None:
+    status_text = _clean_text(display_status)
+    if not status_text:
+        return
+    if status_text == "正常":
+        summary["正常数"] += 1.0
+        return
+    if status_text == "迟到":
+        summary["迟到"] += 1.0
+        return
+    if status_text == "早退":
+        summary["早退"] += 1.0
+        return
+    if status_text == "迟到+早退":
+        summary["迟到"] += 1.0
+        summary["早退"] += 1.0
+        summary["迟到+早退"] += 1.0
+        return
+    if status_text == "未打卡":
+        summary["未打卡"] += 1.0
+        return
+    if status_text in {"上午未打卡", "下午未打卡"}:
+        summary["未打卡"] += 0.5
+        return
+
+    normalized_leave = _normalize_leave_type(status_text)
+    if normalized_leave:
+        summary[normalized_leave] += 1.0
+        return
+
+    parts = [part.strip() for part in re.split(r"[，,]", status_text) if part.strip()]
+    if not parts and status_text:
+        parts = [status_text]
+    for part in parts:
+        _apply_half_status_to_bucket(summary, part)
+
+
+def _rebuild_summary_by_emp_from_detail_sheet(ws) -> Dict[str, Dict[str, float]]:
+    summary_by_emp: Dict[str, Dict[str, float]] = {}
+    employee_ids = [
+        _clean_text(ws.cell(row=2, column=col_idx).value)
+        for col_idx in range(4, ws.max_column + 1)
+        if _clean_text(ws.cell(row=2, column=col_idx).value)
+    ]
+    for emp_id in employee_ids:
+        summary_by_emp[emp_id] = _new_summary_bucket()
+
+    summary_start_row = None
+    for row_idx in range(4, ws.max_row + 1):
+        first_label = _clean_text(ws.cell(row=row_idx, column=1).value)
+        if first_label in SUMMARY_ROWS:
+            summary_start_row = row_idx
+            break
+    if summary_start_row is None:
+        summary_start_row = ws.max_row + 1
+
+    for col_idx in range(4, ws.max_column + 1):
+        emp_id = _clean_text(ws.cell(row=2, column=col_idx).value)
+        if not emp_id:
+            continue
+        summary = summary_by_emp.setdefault(emp_id, _new_summary_bucket())
+        for row_idx in range(4, summary_start_row):
+            _apply_display_status_to_bucket(summary, ws.cell(row=row_idx, column=col_idx).value)
+
+    return summary_by_emp
+
+
+def _rebuild_detail_rows_from_existing_sheet(ws) -> Tuple[List[List[object]], Dict[str, Dict[str, float]], Dict[str, str]]:
+    employee_name_by_id = _parse_detail_sheet_employee_headers(ws)
+    employee_ids = [
+        _clean_text(ws.cell(row=2, column=col_idx).value)
+        for col_idx in range(4, ws.max_column + 1)
+        if _clean_text(ws.cell(row=2, column=col_idx).value)
+    ]
+
+    summary_start_row = None
+    for row_idx in range(4, ws.max_row + 1):
+        first_label = _clean_text(ws.cell(row=row_idx, column=1).value)
+        if first_label in SUMMARY_ROWS:
+            summary_start_row = row_idx
+            break
+    if summary_start_row is None:
+        summary_start_row = ws.max_row + 1
+
+    rows: List[List[object]] = []
+    rows.append(["日期", "星期", "员工工号"] + employee_ids)
+    rows.append(["", "", "员工姓名"] + [employee_name_by_id.get(emp_id, "") for emp_id in employee_ids])
+
+    for row_idx in range(4, summary_start_row):
+        row_values = [_clean_text(ws.cell(row=row_idx, column=1).value), _clean_text(ws.cell(row=row_idx, column=2).value), ""]
+        for col_idx in range(4, 4 + len(employee_ids)):
+            row_values.append(_clean_text(ws.cell(row=row_idx, column=col_idx).value))
+        rows.append(row_values)
+
+    summary_by_emp = _rebuild_summary_by_emp_from_detail_sheet(ws)
+    for label in SUMMARY_ROWS:
+        row = [label, "", ""]
+        for emp_id in employee_ids:
+            row.append(_format_stat_value(summary_by_emp.get(emp_id, _new_summary_bucket()).get(label, 0.0)))
+        rows.append(row)
+
+    for leave_type in LEAVE_TYPE_ROWS:
+        row = [leave_type, "", ""]
+        for emp_id in employee_ids:
+            row.append(_format_stat_value(summary_by_emp.get(emp_id, _new_summary_bucket()).get(leave_type, 0.0)))
+        rows.append(row)
+
+    return rows, summary_by_emp, employee_name_by_id
+
+
+def _replace_sheet_with_writer(wb, sheet_name: str, writer: Callable[[object], None], *, insert_index: Optional[int] = None) -> None:
+    existing_index = insert_index
+    if sheet_name in wb.sheetnames:
+        existing_index = wb.sheetnames.index(sheet_name)
+        wb.remove(wb[sheet_name])
+    if existing_index is None:
+        ws = wb.create_sheet(sheet_name)
+    else:
+        ws = wb.create_sheet(sheet_name, existing_index)
+    writer(ws)
+
+
+def refresh_existing_result_workbook(
+    result_file: str = OUTPUT_FILE,
+    logger: Optional[Callable[[str], None]] = None,
+) -> RefreshSummary:
+    log = logger or (lambda _message: None)
+    result_path = Path(result_file)
+    if not result_path.exists():
+        raise RuntimeError(f"未找到结果文件：{result_path}")
+
+    log("正在读取已有结果文件...")
+    wb = load_workbook(result_path)
+
+    monthly_detail_infos: List[Tuple[int, int, str]] = []
+    for sheet_name in wb.sheetnames:
+        parsed = parse_monthly_detail_sheet_name(sheet_name)
+        if parsed is None:
+            continue
+        monthly_detail_infos.append((parsed[0], parsed[1], sheet_name))
+    monthly_detail_infos.sort()
+    if not monthly_detail_infos:
+        raise RuntimeError("结果文件中未找到任何“YYYY-MM考勤明细”sheet。")
+
+    grouped_by_year: Dict[int, List[Tuple[int, int, str]]] = defaultdict(list)
+    for year, month, sheet_name in monthly_detail_infos:
+        grouped_by_year[year].append((year, month, sheet_name))
+
+    refreshed_months: List[Tuple[int, int]] = []
+    refreshed_years: List[int] = []
+
+    for year in sorted(grouped_by_year):
+        month_entries = grouped_by_year[year]
+        log(f"正在刷新 {year} 年汇总...")
+        merged_employee_name_by_id: Dict[str, str] = {}
+        annual_summary_by_emp: Dict[str, Dict[str, float]] = defaultdict(_new_summary_bucket)
+        monthly_results: List[MonthlyProcessedResult] = []
+
+        annual_sheet_name = get_annual_sheet_name(year)
+        annual_formal_fallback: List[FormalEmployeeLeaveInfo] = []
+        if annual_sheet_name in wb.sheetnames:
+            annual_formal_fallback, _ = _parse_existing_formal_summary_rows(wb[annual_sheet_name])
+
+        for index, (_, month, detail_sheet_name) in enumerate(month_entries, start=1):
+            log(f"[{index}/{len(month_entries)}] 正在刷新 {year}-{month:02d} 月度汇总...")
+            detail_ws = wb[detail_sheet_name]
+            detail_rows, summary_by_emp, detail_employee_name_by_id = _rebuild_detail_rows_from_existing_sheet(detail_ws)
+            merged_employee_name_by_id.update(detail_employee_name_by_id)
+
+            _replace_sheet_with_writer(
+                wb,
+                detail_sheet_name,
+                lambda ws, rows=detail_rows, title=MONTHLY_DETAIL_TITLE_TEMPLATE.format(year=year, month=month): _write_detail_sheet(ws, rows, title),
+            )
+
+            summary_sheet_name = get_monthly_summary_sheet_name(year, month)
+            monthly_formal_employees: List[FormalEmployeeLeaveInfo] = []
+            summary_employee_name_by_id: Dict[str, str] = {}
+            if summary_sheet_name in wb.sheetnames:
+                monthly_formal_employees, summary_employee_name_by_id = _parse_existing_formal_summary_rows(wb[summary_sheet_name])
+                merged_employee_name_by_id.update(summary_employee_name_by_id)
+            if not monthly_formal_employees:
+                monthly_formal_employees = list(annual_formal_fallback)
+            if not monthly_formal_employees:
+                fallback_seq = 1
+                for emp_id, emp_name in sorted(detail_employee_name_by_id.items(), key=lambda item: (int(item[0]) if item[0].isdigit() else item[0])):
+                    monthly_formal_employees.append(FormalEmployeeLeaveInfo(seq=fallback_seq, name=emp_name, annual_leave_total=0.0))
+                    fallback_seq += 1
+
+            monthly_summary_rows = build_monthly_formal_summary_rows(
+                monthly_formal_employees,
+                merged_employee_name_by_id,
+                summary_by_emp,
+            )
+            _replace_sheet_with_writer(
+                wb,
+                summary_sheet_name,
+                lambda ws, rows=monthly_summary_rows, title=FORMAL_TITLE_TEMPLATE.format(year=year, month=month): _write_formal_summary_sheet(ws, rows, title),
+            )
+
+            bundle = MonthlySourceBundle(
+                year=year,
+                month=month,
+                attendance_file=result_path,
+                leave_file=result_path,
+                annual_leave_file=result_path,
+            )
+            monthly_results.append(
+                MonthlyProcessedResult(
+                    bundle=bundle,
+                    employee_name_by_id=dict(detail_employee_name_by_id),
+                    formal_employees=monthly_formal_employees,
+                    report_rows=[],
+                    formal_summary_rows=monthly_summary_rows,
+                    summary_by_emp=summary_by_emp,
+                    workday_source="refresh_from_result",
+                    leave_record_count=0,
+                )
+            )
+            for emp_id, summary in summary_by_emp.items():
+                for key, value in summary.items():
+                    annual_summary_by_emp[emp_id][key] += float(value)
+            refreshed_months.append((year, month))
+            log(f"[{index}/{len(month_entries)}] 已刷新 {year}-{month:02d} 月度汇总")
+
+        annual_formal_employees = merge_annual_formal_employees(monthly_results)
+        annual_rows = build_annual_summary_rows(
+            annual_formal_employees,
+            merged_employee_name_by_id,
+            dict(annual_summary_by_emp),
+        )
+        _replace_sheet_with_writer(
+            wb,
+            annual_sheet_name,
+            lambda ws, rows=annual_rows, title=ANNUAL_TITLE_TEMPLATE.format(year=year): _write_formal_summary_sheet(ws, rows, title),
+            insert_index=0,
+        )
+        refreshed_years.append(year)
+        log(f"已刷新 {year} 年度汇总")
+
+    log("正在保存刷新后的结果文件...")
+    wb.save(result_path)
+    log(f"已刷新: {result_path}")
+    return RefreshSummary(
+        years=refreshed_years,
+        refreshed_months=refreshed_months,
+        output_file=result_path,
+    )
 
 
 def build_report(

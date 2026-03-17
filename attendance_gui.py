@@ -49,11 +49,13 @@ from attendance_report import (
     OUTPUT_FILE,
     MonthFolderInspection,
     MonthlySourceBundle,
+    RefreshSummary,
     ReportSummary,
     discover_monthly_source_bundles,
     generate_report,
     get_current_annual_leave_summary,
     inspect_month_source_folders,
+    refresh_existing_result_workbook,
 )
 
 
@@ -230,8 +232,12 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
         else:
             super().__init__()
         self.title(f"{APP_NAME} {APP_VERSION}")
-        self.geometry("1180x920")
-        self.minsize(1080, 840)
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        target_w = min(1180, max(960, screen_w - 80))
+        target_h = min(920, max(720, screen_h - 120))
+        self.geometry(f"{target_w}x{target_h}")
+        self.minsize(920, 700)
         self.configure(bg=APP_BG)
 
         self.data_dir_var = tk.StringVar(value=str(_default_data_dir()))
@@ -677,10 +683,27 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
         ).grid(row=0, column=1, sticky="e", padx=(16, 0))
         body = tk.Frame(self, bg=APP_BG)
         body.pack(fill="both", expand=True, padx=26, pady=22)
-        body.grid_columnconfigure(0, weight=1)
-        body.grid_rowconfigure(0, weight=1)
 
-        self._build_workspace(body).grid(row=0, column=0, sticky="nsew")
+        canvas = tk.Canvas(body, bg=APP_BG, highlightthickness=0, bd=0)
+        scrollbar = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        content = tk.Frame(canvas, bg=APP_BG)
+        window_id = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def _sync_scroll_region(_event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _sync_canvas_width(event) -> None:
+            canvas.itemconfigure(window_id, width=event.width)
+
+        content.bind("<Configure>", _sync_scroll_region)
+        canvas.bind("<Configure>", _sync_canvas_width)
+        self._scroll_canvas = canvas
+
+        self._build_workspace(content).pack(fill="both", expand=True)
 
     def _make_action_button(
         self,
@@ -928,9 +951,10 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
 
         link_row = tk.Frame(select_box, bg="#FCF8F3")
         link_row.grid(row=5, column=0, columnspan=6, pady=(0, 14))
-        ttk.Button(link_row, text="打开所选月份文件夹", style="App.TButton", command=self.open_selected_month_folder, **self._bs(f"{SECONDARY}-{OUTLINE}")).grid(row=0, column=0, padx=6)
-        ttk.Button(link_row, text="打开放文件夹", style="App.TButton", command=self.open_data_dir, **self._bs(f"{SECONDARY}-{OUTLINE}")).grid(row=0, column=1, padx=6)
-        ttk.Button(link_row, text="打开运行日志", style="App.TButton", command=self.open_runtime_log, **self._bs(f"{SECONDARY}-{OUTLINE}")).grid(row=0, column=2, padx=6)
+        ttk.Button(link_row, text="刷新结果汇总", style="App.TButton", command=self.refresh_existing_result_file, **self._bs(f"{SECONDARY}-{OUTLINE}")).grid(row=0, column=0, padx=6)
+        ttk.Button(link_row, text="打开所选月份文件夹", style="App.TButton", command=self.open_selected_month_folder, **self._bs(f"{SECONDARY}-{OUTLINE}")).grid(row=0, column=1, padx=6)
+        ttk.Button(link_row, text="打开放文件夹", style="App.TButton", command=self.open_data_dir, **self._bs(f"{SECONDARY}-{OUTLINE}")).grid(row=0, column=2, padx=6)
+        ttk.Button(link_row, text="打开运行日志", style="App.TButton", command=self.open_runtime_log, **self._bs(f"{SECONDARY}-{OUTLINE}")).grid(row=0, column=3, padx=6)
 
         info_box = tk.Frame(card, bg=SURFACE_ALT, highlightbackground=LINE, highlightthickness=1, bd=0)
         info_box.grid(row=6, column=0, sticky="ew")
@@ -1150,6 +1174,21 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
             return
         _open_path(output_file)
 
+    def _resolve_refresh_output_file(self) -> Path | None:
+        output_file = Path(self.output_file_var.get())
+        if output_file.exists():
+            return output_file
+        selected = filedialog.askopenfilename(
+            title="请选择之前生成的结果文件",
+            initialdir=str(_app_root()),
+            filetypes=[("Excel 文件", "*.xlsx"), ("所有文件", "*.*")],
+        )
+        if not selected:
+            return None
+        output_file = Path(selected)
+        self.output_file_var.set(str(output_file))
+        return output_file
+
     def _current_annual_target_path(self, suffix: str = ".xlsx") -> Path:
         data_dir = Path(self.data_dir_var.get())
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -1203,6 +1242,43 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
             messagebox.showinfo("提示", "当前还没有上传年假总数表。")
             return
         _open_path(Path(summary["path"]))
+
+    def refresh_existing_result_file(self) -> None:
+        if self._closing:
+            return
+        if self.run_thread and self.run_thread.is_alive():
+            return
+
+        output_file = self._resolve_refresh_output_file()
+        if output_file is None:
+            return
+
+        self.clear_log()
+        self.log(f"开始刷新已有结果文件汇总：{output_file}", MUTED)
+        self.upload_button.configure(state="disabled")
+        self.check_button.configure(state="disabled")
+        self.run_button.configure(state="disabled")
+        self.open_button.configure(state="disabled")
+        self.summary_var.set("正在刷新已有结果文件汇总")
+        self.status_var.set("程序会根据结果文件中的“考勤明细”sheet重算月度和年度汇总。")
+        self.set_notice(
+            "正在刷新已有结果文件汇总。",
+            "如果你刚在 Excel 里改过某个月的考勤明细，请等待刷新完成。",
+            "info",
+        )
+
+        def worker() -> None:
+            try:
+                summary = refresh_existing_result_workbook(
+                    str(output_file),
+                    logger=lambda msg: self.log_queue.put(("log", msg)),
+                )
+                self.log_queue.put(("refresh_done", summary))
+            except Exception:
+                self.log_queue.put(("refresh_error", traceback.format_exc()))
+
+        self.run_thread = threading.Thread(target=worker, daemon=True)
+        self.run_thread.start()
 
     def open_usage_file(self) -> None:
         usage_file = _detailed_usage_file()
@@ -1867,6 +1943,22 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
                     )
                     self._show_generation_success_dialog(summary)
                     self.scan_bundles(preserve_log=True)
+                elif kind == "refresh_done":
+                    summary = payload
+                    assert isinstance(summary, RefreshSummary)
+                    refreshed_months = "、".join(f"{year}-{month:02d}" for year, month in summary.refreshed_months) or "无"
+                    self.log("已有结果文件汇总刷新完成。", SUCCESS)
+                    self.summary_var.set(f"已刷新 {len(summary.refreshed_months)} 个月份的月度/年度汇总")
+                    self.status_var.set(f"结果文件已更新：{summary.output_file}")
+                    self.set_notice(
+                        "已有结果文件汇总已刷新。",
+                        f"已刷新月份：{refreshed_months}",
+                        "success",
+                    )
+                    messagebox.showinfo(
+                        "刷新完成",
+                        f"已有结果文件汇总已刷新。\n\n结果文件：{summary.output_file}\n已刷新年份：{'、'.join(str(year) for year in summary.years)}\n已刷新月份：{refreshed_months}",
+                    )
                 elif kind == "error":
                     self.log("生成失败：", ERROR)
                     self.log(str(payload), ERROR)
@@ -1878,10 +1970,22 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
                         "error",
                     )
                     messagebox.showerror("生成失败", "统计过程中出现错误。\n请检查文件是否完整、文件名是否正确。")
-                if kind in {"done", "error"}:
+                elif kind == "refresh_error":
+                    self.log("刷新汇总失败：", ERROR)
+                    self.log(str(payload), ERROR)
+                    self.summary_var.set("刷新汇总失败，请检查结果文件")
+                    self.status_var.set("刷新失败，请检查结果文件是否被占用或内容是否完整。")
+                    self.set_notice(
+                        "刷新已有结果文件汇总失败。",
+                        "请检查结果文件是否已关闭、sheet 名称是否完整。",
+                        "error",
+                    )
+                    messagebox.showerror("刷新失败", "刷新已有结果文件汇总时出现错误。\n请检查结果文件是否已关闭、sheet 名称是否完整。")
+                if kind in {"done", "refresh_done", "error", "refresh_error"}:
                     self.upload_button.configure(state="normal")
                     self.check_button.configure(state="normal")
                     self.run_button.configure(state="normal")
+                    self.open_button.configure(state="normal")
         except queue.Empty:
             pass
         if not self._closing:
