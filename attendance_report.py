@@ -650,6 +650,62 @@ def inspect_month_source_folders(
     return rows
 
 
+def discover_selected_month_bundle(
+    data_dir: str,
+    target_year: int,
+    target_month: int,
+    *,
+    relaxed: bool = False,
+) -> MonthlySourceBundle:
+    root_dir = Path(data_dir)
+    if not root_dir.exists():
+        raise RuntimeError(f"数据目录不存在：{root_dir}")
+
+    matched_dirs = []
+    for child in sorted(root_dir.iterdir()):
+        if not child.is_dir():
+            continue
+        parsed = _detect_year_month_from_dir_name(child.name)
+        if parsed == (target_year, target_month):
+            matched_dirs.append(child)
+
+    if len(matched_dirs) > 1:
+        raise RuntimeError(f"找到多个 {target_year}-{target_month:02d} 月份目录，请只保留一个。")
+
+    if matched_dirs:
+        month_dir = matched_dirs[0]
+        attendance_files = _find_candidate_files(month_dir, ATTENDANCE_FILE_PATTERNS)
+        leave_files = _find_candidate_files(month_dir, LEAVE_FILE_PATTERNS)
+        annual_files = _find_candidate_files(month_dir, ANNUAL_LEAVE_FILE_PATTERNS)
+        if relaxed and (len(attendance_files) != 1 or len(leave_files) != 1 or len(annual_files) > 1):
+            raise RuntimeError(f"{month_dir} 还没有准备好，无法生成 {target_year}-{target_month:02d}。")
+        attendance_file = _pick_single_file(attendance_files, "考勤打卡", month_dir)
+        leave_file = _pick_single_file(leave_files, "请假", month_dir)
+        if len(annual_files) > 1:
+            raise RuntimeError(f"{month_dir} 中找到多个年假文件，请只保留一个: {annual_files}")
+        annual_leave_file = annual_files[0] if annual_files else resolve_available_annual_leave_file(root_dir)
+        sheet_map = read_input_file(str(attendance_file))
+        detected_year, detected_month = resolve_target_year_month(sheet_map)
+        if (detected_year, detected_month) != (target_year, target_month):
+            raise RuntimeError(
+                f"{attendance_file} 识别到的年月为 {detected_year}-{detected_month:02d}，"
+                f"与当前选择的 {target_year}-{target_month:02d} 不一致。"
+            )
+        return MonthlySourceBundle(
+            year=detected_year,
+            month=detected_month,
+            attendance_file=attendance_file,
+            leave_file=leave_file,
+            annual_leave_file=annual_leave_file,
+        )
+
+    bundles = discover_monthly_source_bundles(data_dir, target_year=target_year, relaxed=relaxed)
+    for bundle in bundles:
+        if bundle.month == target_month:
+            return bundle
+    raise RuntimeError(f"未找到 {target_year}-{target_month:02d} 的可统计文件。")
+
+
 def _detect_leave_year_month(leave_df: pd.DataFrame, file_path: Path) -> Optional[Tuple[int, int]]:
     detected = _extract_year_month_from_text(file_path.stem)
     if detected:
@@ -1933,6 +1989,96 @@ def _replace_sheet_with_writer(wb, sheet_name: str, writer: Callable[[object], N
     writer(ws)
 
 
+def _parse_existing_monthly_summary_sheet(ws) -> Tuple[List[FormalEmployeeLeaveInfo], Dict[str, str], Dict[str, Dict[str, float]]]:
+    formal_employees, employee_name_by_id = _parse_existing_formal_summary_rows(ws)
+    summary_by_emp: Dict[str, Dict[str, float]] = {}
+    if ws.max_row < 4:
+        return formal_employees, employee_name_by_id, summary_by_emp
+
+    header_row = 3
+    header_map = {
+        _strip_unit_suffix(ws.cell(row=header_row, column=col_idx).value): col_idx
+        for col_idx in range(1, ws.max_column + 1)
+    }
+    id_col = header_map.get("工号")
+    name_col = header_map.get("姓名")
+    if name_col is None:
+        return formal_employees, employee_name_by_id, summary_by_emp
+
+    for row_idx in range(header_row + 1, ws.max_row + 1):
+        name = _clean_text(ws.cell(row=row_idx, column=name_col).value)
+        if not name:
+            continue
+        emp_id = _clean_text(ws.cell(row=row_idx, column=id_col).value) if id_col else ""
+        if not emp_id:
+            continue
+        bucket = _new_summary_bucket()
+        for key, label in FORMAL_SUMMARY_COLUMN_SPECS:
+            if key == "事假+病假+未打卡":
+                continue
+            col_idx = header_map.get(label)
+            if col_idx is None:
+                continue
+            bucket[key] = _safe_float(ws.cell(row=row_idx, column=col_idx).value, 0.0)
+        summary_by_emp[emp_id] = bucket
+        employee_name_by_id[emp_id] = name
+
+    return formal_employees, employee_name_by_id, summary_by_emp
+
+
+def rebuild_annual_summary_in_workbook(wb, year: int) -> Tuple[List[List[object]], int]:
+    merged_employee_name_by_id: Dict[str, str] = {}
+    annual_summary_by_emp: Dict[str, Dict[str, float]] = defaultdict(_new_summary_bucket)
+    monthly_results: List[MonthlyProcessedResult] = []
+
+    monthly_summary_infos = []
+    for sheet_name in wb.sheetnames:
+        parsed = parse_monthly_summary_sheet_name(sheet_name)
+        if parsed is None or parsed[0] != year:
+            continue
+        monthly_summary_infos.append((parsed[1], sheet_name))
+    monthly_summary_infos.sort()
+
+    for month, sheet_name in monthly_summary_infos:
+        ws = wb[sheet_name]
+        formal_employees, summary_employee_name_by_id, summary_by_emp = _parse_existing_monthly_summary_sheet(ws)
+        merged_employee_name_by_id.update(summary_employee_name_by_id)
+
+        detail_sheet_name = get_monthly_detail_sheet_name(year, month)
+        if detail_sheet_name in wb.sheetnames:
+            merged_employee_name_by_id.update(_parse_detail_sheet_employee_headers(wb[detail_sheet_name]))
+
+        monthly_results.append(
+            MonthlyProcessedResult(
+                bundle=MonthlySourceBundle(
+                    year=year,
+                    month=month,
+                    attendance_file=Path(sheet_name),
+                    leave_file=Path(sheet_name),
+                    annual_leave_file=Path(sheet_name),
+                ),
+                employee_name_by_id=dict(merged_employee_name_by_id),
+                formal_employees=formal_employees,
+                report_rows=[],
+                formal_summary_rows=[],
+                summary_by_emp=summary_by_emp,
+                workday_source="existing_result",
+                leave_record_count=0,
+            )
+        )
+        for emp_id, summary in summary_by_emp.items():
+            for key, value in summary.items():
+                annual_summary_by_emp[emp_id][key] += float(value)
+
+    annual_formal_employees = merge_annual_formal_employees(monthly_results)
+    annual_rows = build_annual_summary_rows(
+        annual_formal_employees,
+        merged_employee_name_by_id,
+        dict(annual_summary_by_emp),
+    )
+    return annual_rows, len(annual_formal_employees)
+
+
 def refresh_existing_result_workbook(
     result_file: str = OUTPUT_FILE,
     logger: Optional[Callable[[str], None]] = None,
@@ -2383,9 +2529,67 @@ def generate_report(
     output_file: str = OUTPUT_FILE,
     logger: Optional[Callable[[str], None]] = None,
     target_year: Optional[int] = None,
+    target_month: Optional[int] = None,
     relaxed: bool = False,
 ) -> ReportSummary:
     log = logger or (lambda _message: None)
+
+    if target_year is not None and target_month is not None:
+        log(f"正在识别当前选中月份 {target_year}-{target_month:02d}...")
+        bundle = discover_selected_month_bundle(
+            data_dir,
+            target_year,
+            target_month,
+            relaxed=relaxed,
+        )
+        log(f"正在处理 {bundle.year}-{bundle.month:02d}...")
+        monthly_result = process_monthly_bundle(bundle)
+        log(f"已完成 {bundle.year}-{bundle.month:02d}")
+
+        output_path = Path(output_file)
+        if output_path.exists():
+            wb = load_workbook(output_path)
+        else:
+            wb = Workbook()
+            wb.remove(wb.active)
+
+        detail_sheet_name = get_monthly_detail_sheet_name(bundle.year, bundle.month)
+        summary_sheet_name = get_monthly_summary_sheet_name(bundle.year, bundle.month)
+        annual_sheet_name = get_annual_sheet_name(bundle.year)
+
+        log("正在写入当前月份明细和月度汇总...")
+        _replace_sheet_with_writer(
+            wb,
+            detail_sheet_name,
+            lambda ws, rows=monthly_result.report_rows, title=MONTHLY_DETAIL_TITLE_TEMPLATE.format(year=bundle.year, month=bundle.month): _write_detail_sheet(ws, rows, title),
+        )
+        _replace_sheet_with_writer(
+            wb,
+            summary_sheet_name,
+            lambda ws, rows=monthly_result.formal_summary_rows, title=FORMAL_TITLE_TEMPLATE.format(year=bundle.year, month=bundle.month): _write_formal_summary_sheet(ws, rows, title),
+        )
+
+        log("正在重算当前年份年度汇总...")
+        annual_rows, annual_employee_count = rebuild_annual_summary_in_workbook(wb, bundle.year)
+        _replace_sheet_with_writer(
+            wb,
+            annual_sheet_name,
+            lambda ws, rows=annual_rows, title=ANNUAL_TITLE_TEMPLATE.format(year=bundle.year): _write_formal_summary_sheet(ws, rows, title),
+            insert_index=0,
+        )
+        log("正在保存结果文件...")
+        wb.save(output_path)
+        log("正在整理导出结果...")
+        log(f"已生成: {output_path}")
+        log(f"统计年份: {bundle.year}")
+        log("本次仅更新当前选中月份，其余月份明细和月度汇总保持不变。")
+        log(f"当前更新月份: {bundle.year}-{bundle.month:02d}")
+        return ReportSummary(
+            year=bundle.year,
+            monthly_results=[monthly_result],
+            formal_employee_count=annual_employee_count,
+            output_file=output_path,
+        )
 
     log("正在扫描可统计月份...")
     bundles = discover_monthly_source_bundles(data_dir, target_year=target_year, relaxed=relaxed)
@@ -2397,14 +2601,12 @@ def generate_report(
     monthly_results: List[MonthlyProcessedResult] = []
     merged_employee_name_by_id: Dict[str, str] = {}
     annual_summary_by_emp: Dict[str, Dict[str, float]] = defaultdict(_new_summary_bucket)
-    formal_employees: List[FormalEmployeeLeaveInfo] = []
 
     for index, bundle in enumerate(bundles, start=1):
         log(f"[{index}/{len(bundles)}] 正在处理 {bundle.year}-{bundle.month:02d}...")
         monthly_result = process_monthly_bundle(bundle)
         monthly_results.append(monthly_result)
         merged_employee_name_by_id.update(monthly_result.employee_name_by_id)
-        formal_employees = monthly_result.formal_employees
         for emp_id, summary in monthly_result.summary_by_emp.items():
             for key, value in summary.items():
                 annual_summary_by_emp[emp_id][key] += float(value)

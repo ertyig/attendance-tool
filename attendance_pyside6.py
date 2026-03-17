@@ -195,12 +195,13 @@ class WorkerSignals(QtCore.QObject):
 
 
 class ReportWorker(QtCore.QRunnable):
-    def __init__(self, data_dir: str, output_file: str, target_year: int) -> None:
+    def __init__(self, data_dir: str, output_file: str, target_year: int, target_month: int) -> None:
         super().__init__()
         self.signals = WorkerSignals()
         self.data_dir = data_dir
         self.output_file = output_file
         self.target_year = target_year
+        self.target_month = target_month
 
     @QtCore.Slot()
     def run(self) -> None:
@@ -210,6 +211,7 @@ class ReportWorker(QtCore.QRunnable):
                 self.output_file,
                 logger=lambda msg: self.signals.message.emit(str(msg)),
                 target_year=self.target_year,
+                target_month=self.target_month,
                 relaxed=True,
             )
             self.signals.done.emit(summary)
@@ -949,9 +951,19 @@ class AttendancePySide6Window(QtWidgets.QMainWindow):
             self.summary_label.setText("已完成轻量检查，点击“检查当前年份文件”可做完整识别")
             self._set_notice("已完成轻量检查。", f"当前年份发现 {ready_folder_count} 个已就绪月份。需要完整识别时，请点击“检查当前年份文件”。", "info")
         elif bundles:
-            self.status_label.setText(f"已找到 {len(bundles)} 个月份，年度合计会自动一起计算。")
-            self.summary_label.setText(f"已识别 {len(bundles)} 个月份，可以直接生成")
-            self._set_notice("检查通过，可以直接生成结果文件。", f"当前共识别到 {len(bundles)} 个月份。点击“生成结果文件”即可。", "success")
+            try:
+                selected_year, selected_month = self._get_selected_year_month()
+            except ValueError:
+                selected_year, selected_month = (0, 0)
+            selected_ready = any(bundle.year == selected_year and bundle.month == selected_month for bundle in bundles)
+            if selected_ready:
+                self.status_label.setText(f"已找到 {len(bundles)} 个月份，年度合计会自动一起计算。")
+                self.summary_label.setText(f"已识别 {len(bundles)} 个月份，当前选中月份可以直接生成")
+                self._set_notice("检查通过，可以直接生成结果文件。", f"当前共识别到 {len(bundles)} 个月份。本次只会更新当前选中的月份，并重算年度汇总。", "success")
+            else:
+                self.status_label.setText(f"当前年份已识别 {len(bundles)} 个月份，但当前选中月份还不能生成。")
+                self.summary_label.setText("请先把当前选中月份的 2 个文件补齐")
+                self._set_notice("当前选中月份还不能生成。", f"当前年份虽然已有 {len(bundles)} 个月份可统计，但生成时只处理当前选中的月份。", "info")
         else:
             self._on_selected_month_changed()
             self.status_label.setText("没有找到可统计的月份。")
@@ -1075,7 +1087,7 @@ class AttendancePySide6Window(QtWidgets.QMainWindow):
         if self._current_worker is not None:
             return
         try:
-            selected_year = self._get_selected_year()
+            selected_year, selected_month = self._get_selected_year_month()
         except ValueError as exc:
             QtWidgets.QMessageBox.warning(self, "请选择年月", str(exc))
             return
@@ -1089,7 +1101,8 @@ class AttendancePySide6Window(QtWidgets.QMainWindow):
         else:
             self.scan_bundles()
             generation_cache_reused = self._last_scan_used_cache
-        if not self.current_bundles:
+        selected_bundle = next((bundle for bundle in self.current_bundles if bundle.year == selected_year and bundle.month == selected_month), None)
+        if selected_bundle is None:
             detail = self.last_scan_error_message or "请先上传当前年假表，并上传至少一个月份的 2 个表。"
             QtWidgets.QMessageBox.information(self, "无法生成", f"还没有找到可统计的月份。\n\n{detail}")
             return
@@ -1104,7 +1117,7 @@ class AttendancePySide6Window(QtWidgets.QMainWindow):
         self.summary_label.setText("正在生成，请稍等 10-30 秒")
         self._set_notice("正在生成结果文件，请稍等。", "生成过程中不要重复点击按钮。完成后会自动提示你打开结果文件。", "info")
 
-        worker = ReportWorker(str(self.data_dir), str(self.output_file), selected_year)
+        worker = ReportWorker(str(self.data_dir), str(self.output_file), selected_year, selected_month)
         self._current_worker = worker
         worker.signals.message.connect(self.log)
         worker.signals.done.connect(self._on_report_done)

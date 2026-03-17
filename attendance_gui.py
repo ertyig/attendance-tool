@@ -1373,17 +1373,31 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
                 "info",
             )
         elif bundles:
+            try:
+                selected_year, selected_month = self._get_selected_year_month()
+            except ValueError:
+                selected_year, selected_month = (0, 0)
+            selected_ready = any(bundle.year == selected_year and bundle.month == selected_month for bundle in bundles)
             if not selected_folder or not (Path(self.data_dir_var.get()) / selected_folder).exists():
                 parsed = _parse_month_input(self._get_next_month_folder_name())
                 if parsed:
                     self._set_selected_month(*parsed)
-            self.status_var.set(f"已找到 {len(bundles)} 个月份，年度合计会自动一起计算。")
-            self.summary_var.set(f"已识别 {len(bundles)} 个月份，可以直接生成")
-            self.set_notice(
-                "检查通过，可以直接生成结果文件。",
-                f"当前共识别到 {len(bundles)} 个月份。点击中间的“生成结果文件”即可。",
-                "success",
-            )
+            if selected_ready:
+                self.status_var.set(f"已找到 {len(bundles)} 个月份，年度合计会自动一起计算。")
+                self.summary_var.set(f"已识别 {len(bundles)} 个月份，当前选中月份可以直接生成")
+                self.set_notice(
+                    "检查通过，可以直接生成结果文件。",
+                    f"当前共识别到 {len(bundles)} 个月份。本次只会更新当前选中的月份，并重算年度汇总。",
+                    "success",
+                )
+            else:
+                self.status_var.set(f"当前年份已识别 {len(bundles)} 个月份，但当前选中月份还不能生成。")
+                self.summary_var.set("请先把当前选中月份的 2 个文件补齐")
+                self.set_notice(
+                    "当前选中月份还不能生成。",
+                    f"当前年份虽然已有 {len(bundles)} 个月份可统计，但生成时只处理当前选中的月份。",
+                    "info",
+                )
         else:
             self._on_selected_month_changed()
             self.status_var.set("没有找到可统计的月份。")
@@ -1861,7 +1875,7 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
             return
 
         data_dir = Path(self.data_dir_var.get())
-        selected_year = self._get_selected_year()
+        selected_year, selected_month = self._get_selected_year_month()
         cache_key = self._build_scan_cache_key(data_dir, selected_year)
         generation_cache_reused = False
         if self._scan_cache_key == cache_key:
@@ -1873,7 +1887,8 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
             self.scan_bundles()
             generation_cache_reused = self._last_scan_used_cache
 
-        if not self.current_bundles:
+        selected_bundle = next((bundle for bundle in self.current_bundles if bundle.year == selected_year and bundle.month == selected_month), None)
+        if selected_bundle is None:
             issue_lines = self._selected_year_folder_issues()
             detail = self.last_scan_error_message or "请先上传当前年假表，并上传至少一个月份的 2 个表。"
             if issue_lines:
@@ -1913,6 +1928,7 @@ class AttendanceGui(ttk.Window if BOOTSTRAP_ENABLED else tk.Tk):
                     str(output_file),
                     logger=lambda msg: self.log_queue.put(("log", msg)),
                     target_year=selected_year,
+                    target_month=selected_month,
                     relaxed=True,
                 )
                 self.log_queue.put(("done", summary))
